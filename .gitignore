@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+
+# Logs
+*.log
+
+# Reports
+report.json
+tree.txt
+
+# Extracted files
+Extracted/
+extracted/
+
+# Disk images
+*.img
+
+# Archives
+*.zip
+*.7z
+*.rar
+
+# Temporary
+*.tmp
+*.bak
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Notes
+*.txt
+
+# Firmware dumps
+frimware/
+
+# Python virtual environments
+.venv/
+venv/
