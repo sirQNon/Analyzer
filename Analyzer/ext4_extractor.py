@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from ext4 import Ext4Image
-from analyzers import ConfigAnalyzer
+from analyzers import ConfigAnalyzer, UDMConfigAnalyzer
 from directory_extractor import DirectoryExtractor
 from file_extractor import FileExtractor
 from file_info import FileInfo
@@ -93,3 +93,18 @@ if len(files) > 20:
     print(f"... and {len(files) - 20} more")
 
 DirectoryExtractor(fs).extract("/", OUTPUT)
+
+print("=" * 50)
+print("UDM CONFIG ANALYZER")
+print("=" * 50)
+
+analyzer = UDMConfigAnalyzer(fs)
+results = analyzer.analyze()
+
+print(f"Found {len(results)} configuration files")
+
+for item in results[:20]:
+    print(item)
+
+if len(results) > 20:
+    print(f"... and {len(results) - 20} more")
