@@ -1,4 +1,5 @@
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import ext4
 from ext4 import Ext4Image
@@ -100,7 +101,8 @@ for image in (
         print("FULL TREE")
         print("=" * 60)
 
-        fs.walk()
+        with TemporaryDirectory() as temporary_directory:
+            fs.walk(output_path=Path(temporary_directory) / "tree.txt")
 
         print("=" * 60)
         print("READ FILE TEST")
@@ -121,4 +123,4 @@ for image in (
             if data is None:
                 print("File not found")
             else:
-                print(data[:512].decode("utf-8", errors="ignore"))
+                print(data[:512].decode("utf-8", errors="ignore").encode("ascii", errors="backslashreplace").decode("ascii"))

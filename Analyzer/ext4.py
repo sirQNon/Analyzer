@@ -208,11 +208,11 @@ class Ext4Image:
 
         yield from traverse(inode_number, path)
 
-    def walk(self, inode_number=2, path="/"):
+    def walk(self, inode_number=2, path="/", output_path=None):
 
         print("walk()", inode_number, path)
 
-        outfile = Path(__file__).parent / "tree.txt"
+        outfile = Path(output_path) if output_path is not None else Path(__file__).parent / "tree.txt"
 
         for entry in self.iter_directory_tree(inode_number, path):
 
