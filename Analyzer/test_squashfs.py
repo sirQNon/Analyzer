@@ -35,6 +35,7 @@ from squashfs import (
     SquashFSMetadataStream,
     SquashFSMetadataStreamError,
     decode_metadata_reference,
+    directory_entry_reference,
     parse_basic_directory_inode,
     parse_directory_entry,
     parse_directory_header,
@@ -570,7 +571,41 @@ class SquashFSDirectoryReaderTest(unittest.TestCase):
 
         self.assertEqual(
             records,
-            [SquashFSDirectoryRecord(10, 1, b"bin", 3958)],
+            [
+                SquashFSDirectoryRecord(
+                    10,
+                    1,
+                    b"bin",
+                    SquashFSMetadataReference(0, 3958),
+                )
+            ],
+        )
+
+    def test_entries_in_one_header_share_start_block_and_keep_offsets(self):
+        payload = (
+            DIRECTORY_HEADER_STRUCT.pack(1, 42, 10)
+            + self.directory_entry(b"bin", 0, 1, 100)
+            + self.directory_entry(b"etc", -1, 2, 200)
+        )
+
+        records = self.read_payload(payload)
+
+        self.assertEqual(
+            records,
+            [
+                SquashFSDirectoryRecord(
+                    10,
+                    1,
+                    b"bin",
+                    SquashFSMetadataReference(42, 100),
+                ),
+                SquashFSDirectoryRecord(
+                    9,
+                    2,
+                    b"etc",
+                    SquashFSMetadataReference(42, 200),
+                ),
+            ],
         )
 
     def test_reads_directory_with_multiple_headers(self):
@@ -583,8 +618,14 @@ class SquashFSDirectoryReaderTest(unittest.TestCase):
 
         records = self.read_payload(payload)
 
-        self.assertEqual(records[0], SquashFSDirectoryRecord(10, 1, b"bin", 100))
-        self.assertEqual(records[1], SquashFSDirectoryRecord(19, 2, b"etc", 200))
+        self.assertEqual(
+            records[0],
+            SquashFSDirectoryRecord(10, 1, b"bin", SquashFSMetadataReference(0, 100)),
+        )
+        self.assertEqual(
+            records[1],
+            SquashFSDirectoryRecord(19, 2, b"etc", SquashFSMetadataReference(4, 200)),
+        )
 
     def test_preserves_inode_type_and_name_bytes(self):
         payload = (
@@ -596,6 +637,7 @@ class SquashFSDirectoryReaderTest(unittest.TestCase):
 
         self.assertEqual(record.inode_type, 6)
         self.assertEqual(record.name, b"\xff")
+        self.assertEqual(record.inode_reference, SquashFSMetadataReference(0, 1))
 
     def test_stops_at_declared_directory_size(self):
         directory_payload = (
@@ -610,7 +652,14 @@ class SquashFSDirectoryReaderTest(unittest.TestCase):
             )
             self.assertEqual(
                 read_directory(stream, inode),
-                [SquashFSDirectoryRecord(3, 1, b"one", 1)],
+                [
+                    SquashFSDirectoryRecord(
+                        3,
+                        1,
+                        b"one",
+                        SquashFSMetadataReference(0, 1),
+                    )
+                ],
             )
 
     def test_directory_reader_is_repeatable(self):
@@ -642,6 +691,48 @@ class SquashFSDirectoryReaderTest(unittest.TestCase):
             with self.assertRaises(SquashFSDirectoryReaderError):
                 read_directory(stream, self.basic_inode(DIRECTORY_POSITION_OFFSET - 1))
 
+    def test_directory_entry_reference_rejects_invalid_python_types(self):
+        header = SquashFSDirectoryHeader(0, 0, 1)
+        entry = SquashFSDirectoryEntry(0, 0, 1, b"one", 11)
+
+        for invalid_header in (None, "header", object()):
+            with self.assertRaises(TypeError):
+                directory_entry_reference(invalid_header, entry)
+
+        for invalid_entry in (None, "entry", object()):
+            with self.assertRaises(TypeError):
+                directory_entry_reference(header, invalid_entry)
+
+    def test_directory_entry_reference_rejects_invalid_offsets(self):
+        entry = SquashFSDirectoryEntry(0, 0, 1, b"one", 11)
+        with self.assertRaises(SquashFSDirectoryError):
+            directory_entry_reference(SquashFSDirectoryHeader(0, -1, 1), entry)
+        with self.assertRaises(SquashFSDirectoryError):
+            directory_entry_reference(
+                SquashFSDirectoryHeader(0, 0x1_0000_0000, 1),
+                entry,
+            )
+        with self.assertRaises(SquashFSDirectoryError):
+            directory_entry_reference(
+                SquashFSDirectoryHeader(0, True, 1),
+                entry,
+            )
+        with self.assertRaises(SquashFSDirectoryError):
+            directory_entry_reference(
+                SquashFSDirectoryHeader(0, 0, 1),
+                SquashFSDirectoryEntry(-1, 0, 1, b"one", 11),
+            )
+        with self.assertRaises(SquashFSDirectoryError):
+            directory_entry_reference(
+                SquashFSDirectoryHeader(0, 0, 1),
+                SquashFSDirectoryEntry(0x1_0000, 0, 1, b"one", 11),
+            )
+        with self.assertRaises(SquashFSDirectoryError):
+            directory_entry_reference(
+                SquashFSDirectoryHeader(0, 0, 1),
+                SquashFSDirectoryEntry(True, 0, 1, b"one", 11),
+            )
+
     def test_root_directory_integration(self):
         image = SquashFSImage(ROOTFS)
         superblock = image.read_superblock()
@@ -654,8 +745,29 @@ class SquashFSDirectoryReaderTest(unittest.TestCase):
         records = read_directory(directory_stream, root_inode)
 
         self.assertEqual(len(records), 13)
-        self.assertEqual(records[0], SquashFSDirectoryRecord(1, 1, b"bin", 3958))
-        self.assertEqual(records[-1], SquashFSDirectoryRecord(40888, 1, b"var", 2251))
+        expected = {
+            b"bin": (1, 1),
+            b"etc": (124, 1),
+            b"usr": (2976, 1),
+            b"var": (40888, 1),
+        }
+        found = set()
+        for record in records:
+            if record.name not in expected:
+                continue
+
+            found.add(record.name)
+            inode_header = parse_inode_header(
+                inode_stream.read(record.inode_reference, INODE_HEADER_SIZE)
+            )
+            self.assertEqual(
+                (record.inode_number, record.inode_type),
+                expected[record.name],
+            )
+            self.assertEqual(inode_header.inode_number, record.inode_number)
+            self.assertEqual(inode_header.inode_type, record.inode_type)
+
+        self.assertEqual(found, set(expected))
 
 
 if __name__ == "__main__":

@@ -124,7 +124,7 @@ class SquashFSDirectoryRecord:
     inode_number: int
     inode_type: int
     name: bytes
-    offset: int
+    inode_reference: SquashFSMetadataReference
 
 
 class SquashFSMetadataError(ValueError):
@@ -263,6 +263,41 @@ def parse_directory_entry(data: bytes) -> SquashFSDirectoryEntry:
     )
 
 
+def directory_entry_reference(
+    header: SquashFSDirectoryHeader,
+    entry: SquashFSDirectoryEntry,
+) -> SquashFSMetadataReference:
+    """Build an inode-table metadata reference from one directory entry group."""
+    if not isinstance(header, SquashFSDirectoryHeader):
+        raise TypeError("Directory header has an invalid type")
+
+    if not isinstance(entry, SquashFSDirectoryEntry):
+        raise TypeError("Directory entry has an invalid type")
+
+    if (
+        not isinstance(header.start_block, int)
+        or isinstance(header.start_block, bool)
+        or not 0 <= header.start_block <= 0xFFFFFFFF
+    ):
+        raise SquashFSDirectoryError(
+            "Directory header start block is outside the unsigned 32-bit range"
+        )
+
+    if (
+        not isinstance(entry.offset, int)
+        or isinstance(entry.offset, bool)
+        or not 0 <= entry.offset <= 0xFFFF
+    ):
+        raise SquashFSDirectoryError(
+            "Directory entry offset is outside the unsigned 16-bit range"
+        )
+
+    return SquashFSMetadataReference(
+        block_offset=header.start_block,
+        byte_offset=entry.offset,
+    )
+
+
 def read_directory(
     metadata_stream: SquashFSMetadataStream,
     basic_directory_inode: SquashFSBasicDirectoryInode,
@@ -306,7 +341,7 @@ def read_directory(
                     inode_number=header.inode_number + entry.inode_number_delta,
                     inode_type=entry.entry_type,
                     name=entry.name,
-                    offset=entry.offset,
+                    inode_reference=directory_entry_reference(header, entry),
                 )
             )
 
