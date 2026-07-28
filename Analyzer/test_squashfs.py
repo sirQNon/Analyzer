@@ -11,6 +11,8 @@ from squashfs import (
     BASIC_DIRECTORY_INODE_BODY_STRUCT,
     BASIC_DIRECTORY_INODE_SIZE,
     BASIC_DIRECTORY_INODE_TYPE,
+    BASIC_REGULAR_INODE_BODY_STRUCT,
+    BASIC_REGULAR_INODE_TYPE,
     DIRECTORY_ENTRY_SIZE,
     DIRECTORY_ENTRY_STRUCT,
     DIRECTORY_HEADER_SIZE,
@@ -22,7 +24,9 @@ from squashfs import (
     METADATA_UNCOMPRESSED_BIT,
     SQUASHFS_MAGIC,
     SquashFSInodeError,
+    SquashFSInode,
     SquashFSBasicDirectoryInode,
+    SquashFSBasicRegularInode,
     SquashFSDirectoryEntry,
     SquashFSDirectoryError,
     SquashFSDirectoryHeader,
@@ -34,6 +38,7 @@ from squashfs import (
     SquashFSMetadataReference,
     SquashFSMetadataStream,
     SquashFSMetadataStreamError,
+    SquashFSUnsupportedInodeTypeError,
     decode_metadata_reference,
     directory_entry_reference,
     parse_basic_directory_inode,
@@ -41,6 +46,7 @@ from squashfs import (
     parse_directory_header,
     parse_inode_header,
     read_directory,
+    read_inode,
 )
 
 
@@ -768,6 +774,136 @@ class SquashFSDirectoryReaderTest(unittest.TestCase):
             self.assertEqual(inode_header.inode_type, record.inode_type)
 
         self.assertEqual(found, set(expected))
+
+
+class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
+    @staticmethod
+    def directory_inode_bytes(inode_number: int) -> bytes:
+        return INODE_HEADER_STRUCT.pack(1, 0o755, 0, 0, 0, inode_number) + (
+            BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(0, 2, 3, 4, 5)
+        )
+
+    @staticmethod
+    def regular_inode_bytes(inode_number: int) -> bytes:
+        return INODE_HEADER_STRUCT.pack(2, 0o644, 0, 0, 0, inode_number) + (
+            BASIC_REGULAR_INODE_BODY_STRUCT.pack(6, 7, 8, 9)
+        )
+
+    @staticmethod
+    def stream_for(payload: bytes) -> tuple[tempfile.TemporaryDirectory, SquashFSMetadataStream]:
+        directory = tempfile.TemporaryDirectory()
+        image_path = Path(directory.name) / "inodes.bin"
+        image_path.write_bytes(
+            struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(payload)) + payload
+        )
+        return directory, SquashFSMetadataStream(SquashFSImage(image_path), 0)
+
+    @staticmethod
+    def stream_for_blocks(
+        *blocks: bytes,
+    ) -> tuple[tempfile.TemporaryDirectory, SquashFSMetadataStream]:
+        directory = tempfile.TemporaryDirectory()
+        image_path = Path(directory.name) / "inodes.bin"
+        image_path.write_bytes(b"".join(
+            struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(block)) + block
+            for block in blocks
+        ))
+        return directory, SquashFSMetadataStream(SquashFSImage(image_path), 0)
+
+    def test_dispatches_basic_directory_inode(self):
+        directory, stream = self.stream_for(self.directory_inode_bytes(10))
+        with directory:
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+
+        self.assertIsInstance(inode, SquashFSInode)
+        self.assertEqual(inode.reference, SquashFSMetadataReference(0, 0))
+        self.assertEqual(inode.header, SquashFSInodeHeader(1, 0o755, 0, 0, 0, 10))
+        self.assertIsInstance(inode.body, SquashFSBasicDirectoryInode)
+        self.assertEqual((inode.body.start_block, inode.body.nlink, inode.body.file_size, inode.body.offset, inode.body.parent_inode), (0, 2, 3, 4, 5))
+
+    def test_dispatches_basic_regular_inode_after_generic_header(self):
+        directory, stream = self.stream_for(self.regular_inode_bytes(11))
+        with directory:
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+
+        self.assertIsInstance(inode, SquashFSInode)
+        self.assertEqual(inode.reference, SquashFSMetadataReference(0, 0))
+        self.assertEqual(inode.header, SquashFSInodeHeader(2, 0o644, 0, 0, 0, 11))
+        self.assertIsInstance(inode.body, SquashFSBasicRegularInode)
+        self.assertEqual((inode.body.start_block, inode.body.fragment, inode.body.offset, inode.body.file_size), (6, 7, 8, 9))
+
+    def test_reads_inode_body_from_next_metadata_block(self):
+        header = INODE_HEADER_STRUCT.pack(2, 0o644, 0, 0, 0, 12)
+        body = BASIC_REGULAR_INODE_BODY_STRUCT.pack(10, 11, 12, 13)
+        self.assertEqual(len(header), INODE_HEADER_SIZE)
+
+        directory, stream = self.stream_for_blocks(header, body)
+        with directory:
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+
+        self.assertEqual(inode.reference, SquashFSMetadataReference(0, 0))
+        self.assertEqual(inode.header, SquashFSInodeHeader(2, 0o644, 0, 0, 0, 12))
+        self.assertEqual(inode.body, SquashFSBasicRegularInode(inode.header, 10, 11, 12, 13))
+
+    def test_unsupported_known_and_unknown_types_are_distinct_data_errors(self):
+        for inode_type in (3, 99):
+            directory, stream = self.stream_for(INODE_HEADER_STRUCT.pack(inode_type, 0, 0, 0, 0, 1))
+            with directory:
+                with self.assertRaisesRegex(SquashFSUnsupportedInodeTypeError, str(inode_type)):
+                    read_inode(stream, SquashFSMetadataReference(0, 0))
+
+    def test_invalid_stream_and_reference_types_are_rejected(self):
+        directory, stream = self.stream_for(self.directory_inode_bytes(1))
+        with directory:
+            for value in (None, "stream", object()):
+                with self.assertRaises(TypeError):
+                    read_inode(value, SquashFSMetadataReference(0, 0))
+            for value in (None, "reference", object()):
+                with self.assertRaises(TypeError):
+                    read_inode(stream, value)
+
+    def test_truncated_header_and_body_are_rejected_by_metadata_stream(self):
+        for payload in (b"\x01" * (INODE_HEADER_SIZE - 1), self.directory_inode_bytes(1)[:-1]):
+            directory, stream = self.stream_for(payload)
+            with directory:
+                with self.assertRaises(SquashFSMetadataStreamError):
+                    read_inode(stream, SquashFSMetadataReference(0, 0))
+
+    def test_reads_are_repeatable_and_do_not_depend_on_previous_reference(self):
+        first = self.directory_inode_bytes(1)
+        second = self.regular_inode_bytes(2)
+        directory, stream = self.stream_for(first + second)
+        with directory:
+            first_reference = SquashFSMetadataReference(0, 0)
+            second_reference = SquashFSMetadataReference(0, len(first))
+            self.assertEqual(read_inode(stream, first_reference), read_inode(stream, first_reference))
+            self.assertIsInstance(read_inode(stream, second_reference).body, SquashFSBasicRegularInode)
+            self.assertIsInstance(read_inode(stream, first_reference).body, SquashFSBasicDirectoryInode)
+
+    def test_udm_root_directories_and_bin_regular_file(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        inode_stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        root_inode = inode_stream.read_basic_directory_inode(
+            decode_metadata_reference(superblock.root_inode)
+        )
+        directory_stream = SquashFSMetadataStream(image, superblock.directory_table_start)
+        root_records = {record.name: record for record in read_directory(directory_stream, root_inode)}
+
+        for name in (b"bin", b"etc", b"usr", b"var"):
+            record = root_records[name]
+            inode = read_inode(inode_stream, record.inode_reference)
+            self.assertIsInstance(inode.body, SquashFSBasicDirectoryInode)
+            self.assertEqual(inode.header.inode_number, record.inode_number)
+            self.assertEqual(inode.header.inode_type, record.inode_type)
+
+        bin_inode = read_inode(inode_stream, root_records[b"bin"].inode_reference)
+        bin_records = {record.name: record for record in read_directory(directory_stream, bin_inode.body)}
+        bash_record = bin_records[b"bash"]
+        bash_inode = read_inode(inode_stream, bash_record.inode_reference)
+        self.assertIsInstance(bash_inode.body, SquashFSBasicRegularInode)
+        self.assertEqual(bash_inode.header.inode_number, bash_record.inode_number)
+        self.assertEqual(bash_inode.header.inode_type, bash_record.inode_type)
 
 
 if __name__ == "__main__":

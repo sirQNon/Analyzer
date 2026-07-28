@@ -21,6 +21,10 @@ BASIC_DIRECTORY_INODE_TYPE = 1
 BASIC_DIRECTORY_INODE_BODY_STRUCT = struct.Struct("<IIHHI")
 BASIC_DIRECTORY_INODE_BODY_SIZE = BASIC_DIRECTORY_INODE_BODY_STRUCT.size
 BASIC_DIRECTORY_INODE_SIZE = INODE_HEADER_SIZE + BASIC_DIRECTORY_INODE_BODY_SIZE
+BASIC_REGULAR_INODE_TYPE = 2
+BASIC_REGULAR_INODE_BODY_STRUCT = struct.Struct("<IIII")
+BASIC_REGULAR_INODE_BODY_SIZE = BASIC_REGULAR_INODE_BODY_STRUCT.size
+BASIC_REGULAR_INODE_SIZE = INODE_HEADER_SIZE + BASIC_REGULAR_INODE_BODY_SIZE
 DIRECTORY_HEADER_STRUCT = struct.Struct("<III")
 DIRECTORY_HEADER_SIZE = DIRECTORY_HEADER_STRUCT.size
 DIRECTORY_ENTRY_STRUCT = struct.Struct("<HhHH")
@@ -98,6 +102,28 @@ class SquashFSBasicDirectoryInode:
 
 
 @dataclass(frozen=True)
+class SquashFSBasicRegularInode:
+    """The on-disk SquashFS v4 basic regular-file inode."""
+
+    header: SquashFSInodeHeader
+    start_block: int
+    fragment: int
+    offset: int
+    file_size: int
+
+
+SquashFSInodeBody = SquashFSBasicDirectoryInode | SquashFSBasicRegularInode
+
+
+@dataclass(frozen=True)
+class SquashFSInode:
+    """One typed inode together with its metadata location and common header."""
+
+    reference: SquashFSMetadataReference
+    header: SquashFSInodeHeader
+    body: SquashFSInodeBody
+
+@dataclass(frozen=True)
 class SquashFSDirectoryHeader:
     """The fixed on-disk prefix shared by a directory entry group."""
 
@@ -138,6 +164,9 @@ class SquashFSMetadataStreamError(ValueError):
 class SquashFSInodeError(ValueError):
     """Invalid or incomplete common SquashFS inode header."""
 
+
+class SquashFSUnsupportedInodeTypeError(SquashFSInodeError):
+    """A valid SquashFS inode type has no Stage 9 typed parser."""
 
 class SquashFSDirectoryError(ValueError):
     """Invalid or incomplete SquashFS directory structure."""
@@ -197,12 +226,108 @@ def parse_basic_directory_inode(data: bytes) -> SquashFSBasicDirectoryInode:
             f"expected {BASIC_DIRECTORY_INODE_TYPE}, got {header.inode_type}"
         )
 
+    return parse_basic_directory_inode_body(header, data[INODE_HEADER_SIZE:])
+
+
+def parse_basic_directory_inode_body(
+    header: SquashFSInodeHeader,
+    data: bytes,
+) -> SquashFSBasicDirectoryInode:
+    """Decode the basic-directory body immediately following ``header``."""
+    if not isinstance(header, SquashFSInodeHeader):
+        raise TypeError("Basic directory inode header has an invalid type")
+
+    if not isinstance(data, bytes):
+        raise TypeError("Basic directory inode body data must be bytes")
+
+    if len(data) < BASIC_DIRECTORY_INODE_BODY_SIZE:
+        raise SquashFSInodeError(
+            "Basic directory inode body is shorter than "
+            f"{BASIC_DIRECTORY_INODE_BODY_SIZE} bytes: got {len(data)}"
+        )
+
+    if header.inode_type != BASIC_DIRECTORY_INODE_TYPE:
+        raise SquashFSInodeError(
+            "Basic directory inode type mismatch: "
+            f"expected {BASIC_DIRECTORY_INODE_TYPE}, got {header.inode_type}"
+        )
+
     try:
-        body = BASIC_DIRECTORY_INODE_BODY_STRUCT.unpack_from(data, INODE_HEADER_SIZE)
+        body = BASIC_DIRECTORY_INODE_BODY_STRUCT.unpack_from(data)
     except struct.error as error:
         raise SquashFSInodeError("Cannot unpack basic directory inode body") from error
 
     return SquashFSBasicDirectoryInode(header, *body)
+
+
+def parse_basic_regular_inode_body(
+    header: SquashFSInodeHeader,
+    data: bytes,
+) -> SquashFSBasicRegularInode:
+    """Decode the basic regular-file body immediately following ``header``."""
+    if not isinstance(header, SquashFSInodeHeader):
+        raise TypeError("Basic regular inode header has an invalid type")
+
+    if not isinstance(data, bytes):
+        raise TypeError("Basic regular inode body data must be bytes")
+
+    if len(data) < BASIC_REGULAR_INODE_BODY_SIZE:
+        raise SquashFSInodeError(
+            "Basic regular inode body is shorter than "
+            f"{BASIC_REGULAR_INODE_BODY_SIZE} bytes: got {len(data)}"
+        )
+
+    if header.inode_type != BASIC_REGULAR_INODE_TYPE:
+        raise SquashFSInodeError(
+            "Basic regular inode type mismatch: "
+            f"expected {BASIC_REGULAR_INODE_TYPE}, got {header.inode_type}"
+        )
+
+    try:
+        body = BASIC_REGULAR_INODE_BODY_STRUCT.unpack_from(data)
+    except struct.error as error:
+        raise SquashFSInodeError("Cannot unpack basic regular inode body") from error
+
+    return SquashFSBasicRegularInode(header, *body)
+
+
+INODE_BODY_PARSERS = {
+    BASIC_DIRECTORY_INODE_TYPE: (
+        BASIC_DIRECTORY_INODE_BODY_SIZE,
+        parse_basic_directory_inode_body,
+    ),
+    BASIC_REGULAR_INODE_TYPE: (
+        BASIC_REGULAR_INODE_BODY_SIZE,
+        parse_basic_regular_inode_body,
+    ),
+}
+
+
+def read_inode(
+    stream: SquashFSMetadataStream,
+    reference: SquashFSMetadataReference,
+) -> SquashFSInode:
+    """Read one supported typed inode without reading file contents."""
+    if not isinstance(stream, SquashFSMetadataStream):
+        raise TypeError("Inode metadata stream has an invalid type")
+
+    if not isinstance(reference, SquashFSMetadataReference):
+        raise TypeError("Inode metadata reference has an invalid type")
+
+    header = parse_inode_header(stream.read(reference, INODE_HEADER_SIZE))
+    parser_entry = INODE_BODY_PARSERS.get(header.inode_type)
+    if parser_entry is None:
+        raise SquashFSUnsupportedInodeTypeError(
+            f"Unsupported SquashFS inode type: {header.inode_type}"
+        )
+
+    body_size, parser = parser_entry
+    body_reference = SquashFSMetadataReference(
+        block_offset=reference.block_offset,
+        byte_offset=reference.byte_offset + INODE_HEADER_SIZE,
+    )
+    body = parser(header, stream.read(body_reference, body_size))
+    return SquashFSInode(reference=reference, header=header, body=body)
 
 
 def parse_directory_header(data: bytes) -> SquashFSDirectoryHeader:
