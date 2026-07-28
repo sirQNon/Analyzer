@@ -8,10 +8,34 @@ from pathlib import Path
 import zstandard
 
 from squashfs import (
+    BASIC_DIRECTORY_INODE_BODY_STRUCT,
+    BASIC_DIRECTORY_INODE_SIZE,
+    BASIC_DIRECTORY_INODE_TYPE,
+    DIRECTORY_ENTRY_SIZE,
+    DIRECTORY_ENTRY_STRUCT,
+    DIRECTORY_HEADER_SIZE,
+    DIRECTORY_HEADER_STRUCT,
+    DIRECTORY_NAME_MAX,
+    INODE_HEADER_SIZE,
+    INODE_HEADER_STRUCT,
     METADATA_UNCOMPRESSED_BIT,
     SQUASHFS_MAGIC,
+    SquashFSInodeError,
+    SquashFSBasicDirectoryInode,
+    SquashFSDirectoryEntry,
+    SquashFSDirectoryError,
+    SquashFSDirectoryHeader,
+    SquashFSInodeHeader,
     SquashFSImage,
     SquashFSMetadataError,
+    SquashFSMetadataReference,
+    SquashFSMetadataStream,
+    SquashFSMetadataStreamError,
+    decode_metadata_reference,
+    parse_basic_directory_inode,
+    parse_directory_entry,
+    parse_directory_header,
+    parse_inode_header,
 )
 
 
@@ -104,6 +128,392 @@ class SquashFSMetadataBlockTest(unittest.TestCase):
         self.assertLessEqual(len(first.data), 8192)
         self.assertGreater(first.next_offset, first.offset)
         self.assertEqual(first, second)
+
+
+class SquashFSMetadataReferenceTest(unittest.TestCase):
+    def test_reference_decoding(self):
+        self.assertEqual(
+            decode_metadata_reference(0),
+            SquashFSMetadataReference(block_offset=0, byte_offset=0),
+        )
+        self.assertEqual(
+            decode_metadata_reference(0x123456789ABCDEF0),
+            SquashFSMetadataReference(
+                block_offset=0x123456789ABC,
+                byte_offset=0xDEF0,
+            ),
+        )
+        self.assertEqual(
+            decode_metadata_reference(0xFFFFFFFFFFFFFFFF),
+            SquashFSMetadataReference(
+                block_offset=0xFFFFFFFFFFFF,
+                byte_offset=0xFFFF,
+            ),
+        )
+
+    def test_invalid_reference_is_rejected(self):
+        for reference in (-1, 0x10000000000000000):
+            with self.assertRaises(ValueError):
+                decode_metadata_reference(reference)
+
+        for reference in (True, "1"):
+            with self.assertRaises(TypeError):
+                decode_metadata_reference(reference)
+
+
+class SquashFSMetadataStreamTest(unittest.TestCase):
+    def write_stream(self, *blocks: bytes) -> tuple[tempfile.TemporaryDirectory, Path]:
+        directory = tempfile.TemporaryDirectory()
+        image = Path(directory.name) / "metadata.bin"
+        image.write_bytes(b"".join(blocks))
+        return directory, image
+
+    @staticmethod
+    def uncompressed_block(payload: bytes) -> bytes:
+        return struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(payload)) + payload
+
+    @staticmethod
+    def compressed_block(payload: bytes) -> bytes:
+        stored = zstandard.ZstdCompressor().compress(payload)
+        return struct.pack("<H", len(stored)) + stored
+
+    def test_reads_inside_uncompressed_block(self):
+        directory, image = self.write_stream(self.uncompressed_block(b"abcdef"))
+        with directory:
+            stream = SquashFSMetadataStream(SquashFSImage(image), 0)
+            self.assertEqual(
+                stream.read(SquashFSMetadataReference(0, 2), 3),
+                b"cde",
+            )
+
+    def test_reads_inside_compressed_block(self):
+        directory, image = self.write_stream(self.compressed_block(b"abcdef"))
+        with directory:
+            stream = SquashFSMetadataStream(SquashFSImage(image), 0)
+            self.assertEqual(
+                stream.read(SquashFSMetadataReference(0, 1), 4),
+                b"bcde",
+            )
+
+    def test_reads_across_uncompressed_blocks(self):
+        directory, image = self.write_stream(
+            self.uncompressed_block(b"abc"),
+            self.uncompressed_block(b"def"),
+        )
+        with directory:
+            stream = SquashFSMetadataStream(SquashFSImage(image), 0)
+            self.assertEqual(
+                stream.read(SquashFSMetadataReference(0, 2), 4),
+                b"cdef",
+            )
+
+    def test_reads_across_mixed_blocks(self):
+        directory, image = self.write_stream(
+            self.compressed_block(b"hello"),
+            self.uncompressed_block(b"world"),
+        )
+        with directory:
+            stream = SquashFSMetadataStream(SquashFSImage(image), 0)
+            self.assertEqual(
+                stream.read(SquashFSMetadataReference(0, 3), 5),
+                b"lowor",
+            )
+
+    def test_zero_size_does_not_read_image(self):
+        stream = SquashFSMetadataStream(SquashFSImage("missing.bin"), 0)
+        self.assertEqual(stream.read(SquashFSMetadataReference(0, 999), 0), b"")
+
+    def test_invalid_byte_offset_is_rejected(self):
+        directory, image = self.write_stream(self.uncompressed_block(b"abc"))
+        with directory:
+            stream = SquashFSMetadataStream(SquashFSImage(image), 0)
+            with self.assertRaises(SquashFSMetadataStreamError):
+                stream.read(SquashFSMetadataReference(0, 4), 1)
+
+    def test_truncated_stream_is_rejected(self):
+        directory, image = self.write_stream(self.uncompressed_block(b"abc"))
+        with directory:
+            stream = SquashFSMetadataStream(SquashFSImage(image), 0)
+            with self.assertRaises(SquashFSMetadataStreamError):
+                stream.read(SquashFSMetadataReference(0, 2), 2)
+
+    def test_root_inode_reference_stream_integration(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        reference = decode_metadata_reference(superblock.root_inode)
+        stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+
+        first = stream.read(reference, 32)
+        second = stream.read(reference, 32)
+
+        self.assertEqual(reference.block_offset, 0x5A1E8)
+        self.assertEqual(reference.byte_offset, 0x08EB)
+        self.assertEqual(superblock.inode_table_start + reference.block_offset, 0x24467007)
+        self.assertEqual(len(first), 32)
+        self.assertEqual(first, second)
+
+
+class SquashFSInodeHeaderTest(unittest.TestCase):
+    @staticmethod
+    def known_header_data() -> bytes:
+        return INODE_HEADER_STRUCT.pack(
+            1,
+            0o775,
+            0,
+            0,
+            1692784843,
+            43427,
+        )
+
+    def test_parses_known_inode_header(self):
+        header = parse_inode_header(self.known_header_data())
+
+        self.assertEqual(
+            header,
+            SquashFSInodeHeader(
+                inode_type=1,
+                mode=0o775,
+                uid=0,
+                guid=0,
+                mtime=1692784843,
+                inode_number=43427,
+            ),
+        )
+
+    def test_short_inode_header_is_rejected(self):
+        with self.assertRaises(SquashFSInodeError):
+            parse_inode_header(b"\x00" * (INODE_HEADER_SIZE - 1))
+
+    def test_invalid_inode_header_type_is_rejected(self):
+        with self.assertRaises(TypeError):
+            parse_inode_header(bytearray(INODE_HEADER_SIZE))
+
+    def test_inode_header_parser_is_repeatable(self):
+        data = self.known_header_data()
+
+        self.assertEqual(parse_inode_header(data), parse_inode_header(data))
+
+    def test_root_inode_header_stream_integration(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+
+        first = stream.read_inode_header(superblock.root_inode)
+        second = stream.read_inode_header(superblock.root_inode)
+
+        self.assertIsInstance(first, SquashFSInodeHeader)
+        self.assertEqual(first, second)
+        self.assertIsInstance(first.inode_type, int)
+        self.assertIsInstance(first.mode, int)
+        self.assertIsInstance(first.uid, int)
+        self.assertIsInstance(first.guid, int)
+        self.assertIsInstance(first.mtime, int)
+        self.assertIsInstance(first.inode_number, int)
+
+
+class SquashFSBasicDirectoryInodeTest(unittest.TestCase):
+    @staticmethod
+    def known_inode_data(inode_type: int = BASIC_DIRECTORY_INODE_TYPE) -> bytes:
+        return (
+            INODE_HEADER_STRUCT.pack(
+                inode_type,
+                0o775,
+                0,
+                0,
+                1692784843,
+                43427,
+            )
+            + BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(
+                395215,
+                14,
+                226,
+                3260,
+                43428,
+            )
+        )
+
+    def test_parses_known_basic_directory_inode(self):
+        inode = parse_basic_directory_inode(self.known_inode_data())
+
+        self.assertIsInstance(inode, SquashFSBasicDirectoryInode)
+        self.assertEqual(
+            inode.header,
+            SquashFSInodeHeader(1, 0o775, 0, 0, 1692784843, 43427),
+        )
+        self.assertEqual(inode.start_block, 395215)
+        self.assertEqual(inode.nlink, 14)
+        self.assertEqual(inode.file_size, 226)
+        self.assertEqual(inode.offset, 3260)
+        self.assertEqual(inode.parent_inode, 43428)
+
+    def test_short_basic_directory_inode_is_rejected(self):
+        data = b"\x00" * (BASIC_DIRECTORY_INODE_SIZE - 1)
+
+        with self.assertRaises(SquashFSInodeError):
+            parse_basic_directory_inode(data)
+
+    def test_invalid_basic_directory_inode_type_is_rejected(self):
+        data = self.known_inode_data(inode_type=BASIC_DIRECTORY_INODE_TYPE + 1)
+
+        with self.assertRaises(SquashFSInodeError) as error:
+            parse_basic_directory_inode(data)
+
+        self.assertIn("expected 1, got 2", str(error.exception))
+
+    def test_invalid_basic_directory_inode_python_types_are_rejected(self):
+        for value in (bytearray(BASIC_DIRECTORY_INODE_SIZE), "inode", None):
+            with self.assertRaises(TypeError):
+                parse_basic_directory_inode(value)
+
+    def test_basic_directory_inode_parser_is_repeatable(self):
+        data = self.known_inode_data()
+
+        self.assertEqual(
+            parse_basic_directory_inode(data),
+            parse_basic_directory_inode(data),
+        )
+
+    def test_root_basic_directory_inode_stream_integration(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        reference = decode_metadata_reference(superblock.root_inode)
+        stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+
+        inode = stream.read_basic_directory_inode(reference)
+
+        self.assertEqual(inode.header.inode_type, BASIC_DIRECTORY_INODE_TYPE)
+        self.assertEqual(inode.header.mode, 0o775)
+        self.assertEqual(inode.header.inode_number, 43427)
+        self.assertEqual(inode.start_block, 395215)
+        self.assertEqual(inode.nlink, 14)
+        self.assertEqual(inode.file_size, 226)
+        self.assertEqual(inode.offset, 3260)
+        self.assertEqual(inode.parent_inode, 43428)
+
+
+class SquashFSDirectoryHeaderTest(unittest.TestCase):
+    @staticmethod
+    def known_header_data() -> bytes:
+        return DIRECTORY_HEADER_STRUCT.pack(1, 0, 1)
+
+    def test_parses_known_directory_header(self):
+        header = parse_directory_header(self.known_header_data())
+
+        self.assertEqual(header, SquashFSDirectoryHeader(1, 0, 1))
+
+    def test_short_directory_header_is_rejected(self):
+        with self.assertRaises(SquashFSDirectoryError):
+            parse_directory_header(b"\x00" * (DIRECTORY_HEADER_SIZE - 1))
+
+    def test_invalid_directory_header_python_types_are_rejected(self):
+        for value in (bytearray(DIRECTORY_HEADER_SIZE), "header", None):
+            with self.assertRaises(TypeError):
+                parse_directory_header(value)
+
+    def test_directory_header_parser_is_repeatable(self):
+        data = self.known_header_data()
+
+        self.assertEqual(parse_directory_header(data), parse_directory_header(data))
+
+
+class SquashFSDirectoryEntryTest(unittest.TestCase):
+    @staticmethod
+    def entry_data(
+        name: bytes,
+        inode_number_delta: int = 0,
+        offset: int = 3958,
+        entry_type: int = 1,
+    ) -> bytes:
+        return DIRECTORY_ENTRY_STRUCT.pack(
+            offset,
+            inode_number_delta,
+            entry_type,
+            len(name) - 1,
+        ) + name
+
+    def test_parses_known_directory_entry(self):
+        entry = parse_directory_entry(self.entry_data(b"bin"))
+
+        self.assertEqual(
+            entry,
+            SquashFSDirectoryEntry(
+                offset=3958,
+                inode_number_delta=0,
+                entry_type=1,
+                name=b"bin",
+                encoded_size=DIRECTORY_ENTRY_SIZE + 3,
+            ),
+        )
+
+    def test_parses_one_byte_name(self):
+        entry = parse_directory_entry(self.entry_data(b"x"))
+
+        self.assertEqual(entry.name, b"x")
+        self.assertEqual(entry.encoded_size, DIRECTORY_ENTRY_SIZE + 1)
+
+    def test_parses_maximum_name_length(self):
+        name = b"x" * DIRECTORY_NAME_MAX
+        entry = parse_directory_entry(self.entry_data(name))
+
+        self.assertEqual(entry.name, name)
+        self.assertEqual(entry.encoded_size, DIRECTORY_ENTRY_SIZE + DIRECTORY_NAME_MAX)
+
+    def test_short_fixed_directory_entry_is_rejected(self):
+        with self.assertRaises(SquashFSDirectoryError):
+            parse_directory_entry(b"\x00" * (DIRECTORY_ENTRY_SIZE - 1))
+
+    def test_truncated_directory_entry_name_is_rejected(self):
+        data = DIRECTORY_ENTRY_STRUCT.pack(0, 0, 1, 2) + b"ab"
+
+        with self.assertRaises(SquashFSDirectoryError) as error:
+            parse_directory_entry(data)
+
+        self.assertIn("declared 3 bytes, available 2", str(error.exception))
+
+    def test_directory_entry_name_above_confirmed_limit_is_rejected(self):
+        data = DIRECTORY_ENTRY_STRUCT.pack(0, 0, 1, DIRECTORY_NAME_MAX)
+
+        with self.assertRaises(SquashFSDirectoryError) as error:
+            parse_directory_entry(data)
+
+        self.assertIn("declared 257", str(error.exception))
+
+    def test_invalid_directory_entry_python_types_are_rejected(self):
+        for value in (bytearray(DIRECTORY_ENTRY_SIZE), "entry", None):
+            with self.assertRaises(TypeError):
+                parse_directory_entry(value)
+
+    def test_negative_inode_number_delta_is_preserved(self):
+        entry = parse_directory_entry(self.entry_data(b"bin", inode_number_delta=-1))
+
+        self.assertEqual(entry.inode_number_delta, -1)
+
+    def test_directory_entry_trailing_bytes_are_not_consumed(self):
+        data = self.entry_data(b"bin") + self.entry_data(b"etc")
+        entry = parse_directory_entry(data)
+
+        self.assertEqual(entry.name, b"bin")
+        self.assertEqual(entry.encoded_size, DIRECTORY_ENTRY_SIZE + len(b"bin"))
+
+    def test_directory_entry_parser_is_repeatable(self):
+        data = self.entry_data(b"bin")
+
+        self.assertEqual(parse_directory_entry(data), parse_directory_entry(data))
+
+    def test_root_directory_header_and_entry_dump(self):
+        header = parse_directory_header(
+            bytes.fromhex("01 00 00 00 00 00 00 00 01 00 00 00")
+        )
+        entry = parse_directory_entry(
+            bytes.fromhex("76 0f 00 00 01 00 02 00 62 69 6e")
+        )
+
+        self.assertEqual(header, SquashFSDirectoryHeader(1, 0, 1))
+        self.assertEqual(entry.offset, 3958)
+        self.assertEqual(entry.inode_number_delta, 0)
+        self.assertEqual(entry.entry_type, 1)
+        self.assertEqual(entry.name, b"bin")
+        self.assertEqual(entry.encoded_size, DIRECTORY_ENTRY_SIZE + 3)
 
 
 if __name__ == "__main__":
