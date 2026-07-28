@@ -45,5 +45,9 @@ Desktop.ini
 frimware/
 
 # Python virtual environments
+.codex-venv/
 .venv/
 venv/
+
+# Codex-local tools
+.tools/
