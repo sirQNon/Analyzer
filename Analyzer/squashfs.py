@@ -26,6 +26,7 @@ DIRECTORY_HEADER_SIZE = DIRECTORY_HEADER_STRUCT.size
 DIRECTORY_ENTRY_STRUCT = struct.Struct("<HhHH")
 DIRECTORY_ENTRY_SIZE = DIRECTORY_ENTRY_STRUCT.size
 DIRECTORY_NAME_MAX = 256
+DIRECTORY_POSITION_OFFSET = 3
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,16 @@ class SquashFSDirectoryEntry:
     encoded_size: int
 
 
+@dataclass(frozen=True)
+class SquashFSDirectoryRecord:
+    """One resolved record in a single SquashFS directory stream."""
+
+    inode_number: int
+    inode_type: int
+    name: bytes
+    offset: int
+
+
 class SquashFSMetadataError(ValueError):
     """Invalid or unreadable SquashFS metadata block."""
 
@@ -130,6 +141,10 @@ class SquashFSInodeError(ValueError):
 
 class SquashFSDirectoryError(ValueError):
     """Invalid or incomplete SquashFS directory structure."""
+
+
+class SquashFSDirectoryReaderError(ValueError):
+    """A directory inode cannot be read as a complete directory stream."""
 
 
 def decode_metadata_reference(reference: int) -> SquashFSMetadataReference:
@@ -246,6 +261,62 @@ def parse_directory_entry(data: bytes) -> SquashFSDirectoryEntry:
         name=data[DIRECTORY_ENTRY_SIZE:encoded_size],
         encoded_size=encoded_size,
     )
+
+
+def read_directory(
+    metadata_stream: SquashFSMetadataStream,
+    basic_directory_inode: SquashFSBasicDirectoryInode,
+) -> list[SquashFSDirectoryRecord]:
+    """Read exactly one basic-directory inode's on-disk directory records."""
+    if not isinstance(metadata_stream, SquashFSMetadataStream):
+        raise TypeError("Directory metadata stream has an invalid type")
+
+    if not isinstance(basic_directory_inode, SquashFSBasicDirectoryInode):
+        raise TypeError("Basic directory inode has an invalid type")
+
+    if basic_directory_inode.file_size < DIRECTORY_POSITION_OFFSET:
+        raise SquashFSDirectoryReaderError(
+            "Directory inode file size is smaller than the directory position offset: "
+            f"size {basic_directory_inode.file_size}, "
+            f"offset {DIRECTORY_POSITION_OFFSET}"
+        )
+
+    stream_size = basic_directory_inode.file_size - DIRECTORY_POSITION_OFFSET
+    if stream_size == 0:
+        return []
+
+    reference = SquashFSMetadataReference(
+        block_offset=basic_directory_inode.start_block,
+        byte_offset=basic_directory_inode.offset,
+    )
+    data = metadata_stream.read(reference, stream_size)
+    cursor = 0
+    records: list[SquashFSDirectoryRecord] = []
+
+    while cursor < len(data):
+        header = parse_directory_header(data[cursor:])
+        cursor += DIRECTORY_HEADER_SIZE
+        entry_count = header.count + 1
+
+        for _ in range(entry_count):
+            entry = parse_directory_entry(data[cursor:])
+            cursor += entry.encoded_size
+            records.append(
+                SquashFSDirectoryRecord(
+                    inode_number=header.inode_number + entry.inode_number_delta,
+                    inode_type=entry.entry_type,
+                    name=entry.name,
+                    offset=entry.offset,
+                )
+            )
+
+    if cursor != stream_size:
+        raise SquashFSDirectoryReaderError(
+            "Directory parser did not stop at the declared stream size: "
+            f"cursor {cursor}, size {stream_size}"
+        )
+
+    return records
 
 
 class SquashFSImage:

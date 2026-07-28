@@ -16,6 +16,7 @@ from squashfs import (
     DIRECTORY_HEADER_SIZE,
     DIRECTORY_HEADER_STRUCT,
     DIRECTORY_NAME_MAX,
+    DIRECTORY_POSITION_OFFSET,
     INODE_HEADER_SIZE,
     INODE_HEADER_STRUCT,
     METADATA_UNCOMPRESSED_BIT,
@@ -25,6 +26,8 @@ from squashfs import (
     SquashFSDirectoryEntry,
     SquashFSDirectoryError,
     SquashFSDirectoryHeader,
+    SquashFSDirectoryReaderError,
+    SquashFSDirectoryRecord,
     SquashFSInodeHeader,
     SquashFSImage,
     SquashFSMetadataError,
@@ -36,6 +39,7 @@ from squashfs import (
     parse_directory_entry,
     parse_directory_header,
     parse_inode_header,
+    read_directory,
 )
 
 
@@ -514,6 +518,144 @@ class SquashFSDirectoryEntryTest(unittest.TestCase):
         self.assertEqual(entry.entry_type, 1)
         self.assertEqual(entry.name, b"bin")
         self.assertEqual(entry.encoded_size, DIRECTORY_ENTRY_SIZE + 3)
+
+
+class SquashFSDirectoryReaderTest(unittest.TestCase):
+    @staticmethod
+    def basic_inode(file_size: int) -> SquashFSBasicDirectoryInode:
+        return SquashFSBasicDirectoryInode(
+            header=SquashFSInodeHeader(1, 0o755, 0, 0, 0, 1),
+            start_block=0,
+            nlink=2,
+            file_size=file_size,
+            offset=0,
+            parent_inode=1,
+        )
+
+    @staticmethod
+    def directory_entry(
+        name: bytes,
+        inode_number_delta: int,
+        entry_type: int,
+        offset: int,
+    ) -> bytes:
+        return DIRECTORY_ENTRY_STRUCT.pack(
+            offset,
+            inode_number_delta,
+            entry_type,
+            len(name) - 1,
+        ) + name
+
+    def directory_stream(self, payload: bytes) -> tuple[tempfile.TemporaryDirectory, SquashFSMetadataStream]:
+        directory = tempfile.TemporaryDirectory()
+        image = Path(directory.name) / "directory.bin"
+        image.write_bytes(
+            struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(payload)) + payload
+        )
+        return directory, SquashFSMetadataStream(SquashFSImage(image), 0)
+
+    def read_payload(self, payload: bytes) -> list[SquashFSDirectoryRecord]:
+        directory, stream = self.directory_stream(payload)
+        with directory:
+            inode = self.basic_inode(len(payload) + DIRECTORY_POSITION_OFFSET)
+            return read_directory(stream, inode)
+
+    def test_reads_directory_with_one_header(self):
+        payload = (
+            DIRECTORY_HEADER_STRUCT.pack(0, 0, 10)
+            + self.directory_entry(b"bin", 0, 1, 3958)
+        )
+
+        records = self.read_payload(payload)
+
+        self.assertEqual(
+            records,
+            [SquashFSDirectoryRecord(10, 1, b"bin", 3958)],
+        )
+
+    def test_reads_directory_with_multiple_headers(self):
+        payload = (
+            DIRECTORY_HEADER_STRUCT.pack(0, 0, 10)
+            + self.directory_entry(b"bin", 0, 1, 100)
+            + DIRECTORY_HEADER_STRUCT.pack(0, 4, 20)
+            + self.directory_entry(b"etc", -1, 2, 200)
+        )
+
+        records = self.read_payload(payload)
+
+        self.assertEqual(records[0], SquashFSDirectoryRecord(10, 1, b"bin", 100))
+        self.assertEqual(records[1], SquashFSDirectoryRecord(19, 2, b"etc", 200))
+
+    def test_preserves_inode_type_and_name_bytes(self):
+        payload = (
+            DIRECTORY_HEADER_STRUCT.pack(0, 0, 7)
+            + self.directory_entry(b"\xff", 0, 6, 1)
+        )
+
+        record = self.read_payload(payload)[0]
+
+        self.assertEqual(record.inode_type, 6)
+        self.assertEqual(record.name, b"\xff")
+
+    def test_stops_at_declared_directory_size(self):
+        directory_payload = (
+            DIRECTORY_HEADER_STRUCT.pack(0, 0, 3)
+            + self.directory_entry(b"one", 0, 1, 1)
+        )
+        trailing_payload = directory_payload + b"unused metadata"
+        directory, stream = self.directory_stream(trailing_payload)
+        with directory:
+            inode = self.basic_inode(
+                len(directory_payload) + DIRECTORY_POSITION_OFFSET
+            )
+            self.assertEqual(
+                read_directory(stream, inode),
+                [SquashFSDirectoryRecord(3, 1, b"one", 1)],
+            )
+
+    def test_directory_reader_is_repeatable(self):
+        payload = (
+            DIRECTORY_HEADER_STRUCT.pack(0, 0, 3)
+            + self.directory_entry(b"one", 0, 1, 1)
+        )
+        directory, stream = self.directory_stream(payload)
+        with directory:
+            inode = self.basic_inode(len(payload) + DIRECTORY_POSITION_OFFSET)
+            self.assertEqual(read_directory(stream, inode), read_directory(stream, inode))
+
+    def test_invalid_python_types_are_rejected(self):
+        inode = self.basic_inode(DIRECTORY_POSITION_OFFSET)
+
+        for invalid_stream in (None, "stream", object()):
+            with self.assertRaises(TypeError):
+                read_directory(invalid_stream, inode)
+
+        directory, stream = self.directory_stream(b"")
+        with directory:
+            for invalid_inode in (None, "inode", object()):
+                with self.assertRaises(TypeError):
+                    read_directory(stream, invalid_inode)
+
+    def test_invalid_directory_size_is_rejected(self):
+        directory, stream = self.directory_stream(b"")
+        with directory:
+            with self.assertRaises(SquashFSDirectoryReaderError):
+                read_directory(stream, self.basic_inode(DIRECTORY_POSITION_OFFSET - 1))
+
+    def test_root_directory_integration(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        inode_stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        root_inode = inode_stream.read_basic_directory_inode(
+            decode_metadata_reference(superblock.root_inode)
+        )
+        directory_stream = SquashFSMetadataStream(image, superblock.directory_table_start)
+
+        records = read_directory(directory_stream, root_inode)
+
+        self.assertEqual(len(records), 13)
+        self.assertEqual(records[0], SquashFSDirectoryRecord(1, 1, b"bin", 3958))
+        self.assertEqual(records[-1], SquashFSDirectoryRecord(40888, 1, b"var", 2251))
 
 
 if __name__ == "__main__":
