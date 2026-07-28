@@ -39,6 +39,7 @@ Desktop.ini
 
 # Notes
 *.txt
+!Analyzer/requirements.txt
 
 # Firmware dumps
 frimware/
