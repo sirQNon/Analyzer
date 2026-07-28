@@ -118,9 +118,14 @@ for image in (
             print("READ PATH TEST")
             print("=" * 60)
 
-            data = fs.read_path("/rootfs")
+            inode_number = fs.path_to_inode("/rootfs")
 
-            if data is None:
+            if inode_number is None:
                 print("File not found")
             else:
+                info = fs.parse_inode(fs.read_inode(inode_number))
+                data = fs.read_file_range(inode_number, 0, 512)
+                assert info["size"] == 609071104
+                assert len(data) == 512
+                assert data[:4] == b"hsqs"
                 print(data[:512].decode("utf-8", errors="ignore").encode("ascii", errors="backslashreplace").decode("ascii"))

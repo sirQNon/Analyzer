@@ -398,6 +398,54 @@ class Ext4Image:
                 data.extend(self.read_block(start + i))
 
         return bytes(data[:info["size"]])
+
+    def read_file_range(self, inode_number, offset, size):
+
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise TypeError("offset must be an integer")
+
+        if not isinstance(size, int) or isinstance(size, bool):
+            raise TypeError("size must be an integer")
+
+        if offset < 0:
+            raise ValueError("offset must not be negative")
+
+        if size < 0:
+            raise ValueError("size must not be negative")
+
+        raw_inode = self.read_inode(inode_number)
+        info = self.parse_inode(raw_inode)
+
+        if size == 0 or offset >= info["size"]:
+            return b""
+
+        if self.superblock is None:
+            self.read_superblock()
+
+        block_size = self.superblock["block_size"]
+        read_size = min(size, info["size"] - offset)
+        first_block = offset // block_size
+        last_block = (offset + read_size - 1) // block_size
+        extents = self.extents.get_extents(raw_inode)
+        data = bytearray()
+
+        for logical_block in range(first_block, last_block + 1):
+            block_start = logical_block * block_size
+            slice_start = max(offset, block_start) - block_start
+            slice_end = min(offset + read_size, block_start + block_size) - block_start
+
+            for extent in extents:
+                extent_end = extent["logical_block"] + extent["length"]
+                if extent["logical_block"] <= logical_block < extent_end:
+                    physical_block = extent["physical_block"] + (
+                        logical_block - extent["logical_block"]
+                    )
+                    data.extend(self.read_block(physical_block)[slice_start:slice_end])
+                    break
+            else:
+                data.extend(b"\x00" * (slice_end - slice_start))
+
+        return bytes(data)
         
     def print_groups(self):
 
