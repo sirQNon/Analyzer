@@ -60,6 +60,9 @@ DIRECTORY_ENTRY_STRUCT = struct.Struct("<HhHH")
 DIRECTORY_ENTRY_SIZE = DIRECTORY_ENTRY_STRUCT.size
 DIRECTORY_NAME_MAX = 256
 DIRECTORY_POSITION_OFFSET = 3
+SQUASHFS_INVALID_BLK = 0xFFFFFFFFFFFFFFFF
+INODE_LOOKUP_ENTRY_STRUCT = struct.Struct("<Q")
+INODE_LOOKUP_ENTRY_SIZE = INODE_LOOKUP_ENTRY_STRUCT.size
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,21 @@ class SquashFSMetadataReference:
 
     block_offset: int
     byte_offset: int
+
+
+@dataclass(frozen=True)
+class SquashFSInodeReference:
+    raw_value: int
+    block: int
+    offset: int
+
+
+@dataclass(frozen=True)
+class SquashFSInodeLookupTable:
+    lookup_table_start: int
+    inode_count: int
+    metadata_block_offsets: tuple[int, ...]
+    next_table: int
 
 
 @dataclass(frozen=True)
@@ -281,6 +299,22 @@ class SquashFSInodeError(ValueError):
     """Invalid or incomplete common SquashFS inode header."""
 
 
+class SquashFSInodeLookupError(ValueError):
+    """The SquashFS inode lookup/export infrastructure is invalid."""
+
+
+class SquashFSInodeLookupTableError(SquashFSInodeLookupError):
+    """The lookup table index is malformed or unavailable."""
+
+
+class SquashFSInodeLookupIndexError(SquashFSInodeLookupError):
+    """An inode number is outside the lookup-table range."""
+
+
+class SquashFSInodeLookupEntryError(SquashFSInodeLookupError):
+    """A logical lookup entry cannot be read or decoded."""
+
+
 class SquashFSUnsupportedInodeTypeError(SquashFSInodeError):
     """A valid SquashFS inode type has no Stage 9 typed parser."""
 
@@ -360,6 +394,64 @@ def decode_metadata_reference(reference: int) -> SquashFSMetadataReference:
         block_offset=reference >> 16,
         byte_offset=reference & 0xFFFF,
     )
+
+
+def _inode_lookup_block_count(inode_count: int) -> int:
+    if not isinstance(inode_count, int) or isinstance(inode_count, bool) or inode_count <= 0:
+        raise SquashFSInodeLookupTableError("Lookup table inode count must be positive")
+    return (inode_count * INODE_LOOKUP_ENTRY_SIZE + METADATA_SIZE - 1) // METADATA_SIZE
+
+
+def read_inode_lookup_table(image: SquashFSImage, next_table: int | None = None) -> SquashFSInodeLookupTable | None:
+    """Read and validate the uncompressed index for the inode lookup table."""
+    if not isinstance(image, SquashFSImage):
+        raise TypeError("Lookup table image has an invalid type")
+    superblock = image.superblock or image.read_superblock()
+    start = superblock.lookup_table_start
+    if start == SQUASHFS_INVALID_BLK:
+        return None
+    count = _inode_lookup_block_count(superblock.inode_count)
+    index_size = count * INODE_LOOKUP_ENTRY_SIZE
+    next_table = start + index_size if next_table is None else next_table
+    image_size = image.image.stat().st_size
+    if start < 0 or start > next_table or next_table - start != index_size or next_table > image_size:
+        raise SquashFSInodeLookupTableError("Lookup table index bounds are invalid")
+    with image.image.open("rb") as source:
+        source.seek(start); data = source.read(index_size)
+    if len(data) != index_size:
+        raise SquashFSInodeLookupTableError("Lookup table index is truncated")
+    offsets = tuple(INODE_LOOKUP_ENTRY_STRUCT.unpack_from(data, pos)[0] for pos in range(0, index_size, 8))
+    previous = -1
+    for offset in offsets:
+        if offset >= image_size or offset <= previous or offset >= start or (previous >= 0 and offset - previous > METADATA_SIZE + METADATA_HEADER_SIZE):
+            raise SquashFSInodeLookupTableError("Lookup metadata block offsets are invalid")
+        previous = offset
+    if start - previous > METADATA_SIZE + METADATA_HEADER_SIZE:
+        raise SquashFSInodeLookupTableError("Final lookup metadata block distance is invalid")
+    return SquashFSInodeLookupTable(start, superblock.inode_count, offsets, next_table)
+
+
+def read_inode_lookup_entry(image: SquashFSImage, table: SquashFSInodeLookupTable | None, inode_number: int) -> SquashFSInodeReference:
+    if table is None:
+        raise SquashFSInodeLookupTableError("Inode lookup table is unavailable")
+    if not isinstance(inode_number, int) or isinstance(inode_number, bool) or not 1 <= inode_number <= table.inode_count:
+        raise SquashFSInodeLookupIndexError("Inode number is outside lookup table range")
+    logical = inode_number - 1; byte_offset = logical * 8
+    block_index, block_offset = divmod(byte_offset, METADATA_SIZE)
+    try:
+        data = SquashFSMetadataStream(image, table.metadata_block_offsets[block_index]).read(SquashFSMetadataReference(0, block_offset), 8)
+        raw = INODE_LOOKUP_ENTRY_STRUCT.unpack(data)[0]
+    except (SquashFSMetadataError, SquashFSMetadataStreamError, struct.error) as error:
+        raise SquashFSInodeLookupEntryError("Cannot read inode lookup entry") from error
+    return SquashFSInodeReference(raw, raw >> 16, raw & 0xffff)
+
+
+def resolve_inode_number(image: SquashFSImage, inode_stream: SquashFSMetadataStream, table: SquashFSInodeLookupTable | None, inode_number: int) -> SquashFSInode:
+    reference = read_inode_lookup_entry(image, table, inode_number)
+    try:
+        return read_inode(inode_stream, SquashFSMetadataReference(reference.block, reference.offset))
+    except (SquashFSInodeError, SquashFSMetadataStreamError) as error:
+        raise SquashFSInodeLookupEntryError("Lookup inode reference cannot be resolved") from error
 
 
 def parse_inode_header(data: bytes) -> SquashFSInodeHeader:

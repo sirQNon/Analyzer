@@ -27,6 +27,7 @@ from squashfs import (
     EXTENDED_SYMLINK_INODE_BODY_STRUCT,
     EXTENDED_SYMLINK_INODE_TYPE,
     DIRECTORY_INDEX_STRUCT,
+    SQUASHFS_INVALID_BLK,
     DIRECTORY_ENTRY_SIZE,
     DIRECTORY_ENTRY_STRUCT,
     DIRECTORY_HEADER_SIZE,
@@ -52,6 +53,9 @@ from squashfs import (
     SquashFSExtendedRegularInode,
     SquashFSExtendedDirectoryInode,
     SquashFSExtendedSymlinkInode,
+    SquashFSInodeLookupIndexError,
+    SquashFSInodeLookupEntryError,
+    SquashFSInodeLookupTableError,
     SquashFSDirectoryIndex,
     SquashFSDirectoryEntry,
     SquashFSDirectoryError,
@@ -93,6 +97,9 @@ from squashfs import (
     read_extended_regular_file,
     read_directory_indexes,
     read_extended_symlink,
+    read_inode_lookup_table,
+    read_inode_lookup_entry,
+    resolve_inode_number,
     read_basic_symlink,
     read_directory,
     read_inode,
@@ -968,6 +975,278 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         self.assertIsInstance(bash_inode.body, SquashFSBasicRegularInode)
         self.assertEqual(bash_inode.header.inode_number, bash_record.inode_number)
         self.assertEqual(bash_inode.header.inode_type, bash_record.inode_type)
+
+
+class _InodeLookupFixture(unittest.TestCase):
+    """Small on-disk lookup fixtures; index entries are real SquashFS metadata."""
+    def make_lookup_image(self, inode_count=1, offsets=None, payloads=None, *, lookup_start=None,
+                          next_table=None, truncate_index=False, lookup_value=None):
+        directory = tempfile.TemporaryDirectory()
+        path = Path(directory.name) / "lookup.sqfs"
+        count = (inode_count * 8 + 8191) // 8192
+        offsets = list(offsets if offsets is not None else [1024 + n * 8194 for n in range(count)])
+        if lookup_start is None:
+            lookup_start = offsets[-1] + 8194 if offsets else 1024
+        payloads = list(payloads if payloads is not None else [b"".join(struct.pack("<Q", ((n + 1) << 16) | n) for n in range(1024)) for _ in range(count)])
+        index_size = count * 8
+        end = max([lookup_start + index_size, *(offset + 2 + len(payload) for offset, payload in zip(offsets, payloads))])
+        contents = bytearray(end)
+        sb = struct.pack("<IIIIIHHHHHHQQQQQQQQ", SQUASHFS_MAGIC, inode_count, 0, 4096, 0, 6, 12, 0, 1, 4, 0,
+                         0, end, lookup_start + index_size, 0, 0, 0, 0, lookup_start)
+        contents[:len(sb)] = sb
+        for offset, payload in zip(offsets, payloads):
+            contents[offset:offset + 2] = struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(payload))
+            contents[offset + 2:offset + 2 + len(payload)] = payload
+        entries = b"".join(struct.pack("<Q", value) for value in offsets)
+        if truncate_index: entries = entries[:-1]
+        contents[lookup_start:lookup_start + len(entries)] = entries
+        path.write_bytes(contents)
+        return directory, SquashFSImage(path), lookup_start + index_size if next_table is None else next_table
+
+
+class SquashFSInodeLookupTableReaderTest(_InodeLookupFixture):
+    def test_absent_table_is_not_an_error(self):
+        image = SquashFSImage(ROOTFS)
+        table = read_inode_lookup_table(image)
+        self.assertTrue(table is None or table.inode_count > 0)
+
+    def test_rootfs_has_expected_metadata_index_count(self):
+        table = read_inode_lookup_table(SquashFSImage(ROOTFS))
+        self.assertIsNotNone(table)
+        self.assertEqual(len(table.metadata_block_offsets), 43)
+
+    def test_table_is_immutable(self):
+        table = read_inode_lookup_table(SquashFSImage(ROOTFS))
+        with self.assertRaises(AttributeError): table.inode_count = 0
+
+    def test_invalid_next_table_is_rejected(self):
+        image = SquashFSImage(ROOTFS); start = image.read_superblock().lookup_table_start
+        with self.assertRaises(SquashFSInodeLookupTableError): read_inode_lookup_table(image, start)
+
+    def test_one_inode_produces_one_index_entry(self):
+        d, image, end = self.make_lookup_image();
+        with d: self.assertEqual(len(read_inode_lookup_table(image, end).metadata_block_offsets), 1)
+    def test_multiple_metadata_block_index_offsets(self):
+        d, image, end = self.make_lookup_image(1025)
+        with d: self.assertEqual(len(read_inode_lookup_table(image, end).metadata_block_offsets), 2)
+    def test_exact_computed_index_table_byte_size(self):
+        d, image, end = self.make_lookup_image(1025)
+        with d:
+            table = read_inode_lookup_table(image, end)
+            self.assertEqual(table.next_table - table.lookup_table_start, 16)
+    def test_inode_count_zero_is_typed_error(self):
+        d, image, end = self.make_lookup_image(0, offsets=[] , payloads=[])
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, end)
+    def test_lookup_start_outside_image_is_typed_error(self):
+        d, image, end = self.make_lookup_image()
+        with d:
+            raw = bytearray(image.image.read_bytes()); struct.pack_into('<Q', raw, 88, 999999); image.image.write_bytes(raw)
+            self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, SquashFSImage(image.image))
+    def test_next_table_before_start_is_typed_error(self):
+        d, image, _ = self.make_lookup_image(); start = image.read_superblock().lookup_table_start
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, start - 1)
+    def test_next_table_equal_start_is_typed_error(self):
+        d, image, _ = self.make_lookup_image(); start = image.read_superblock().lookup_table_start
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, start)
+    def test_index_table_size_mismatch_is_typed_error(self):
+        d, image, _ = self.make_lookup_image(1025)
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, 20008)
+    def test_first_offset_outside_image_is_typed_error(self):
+        d, image, end = self.make_lookup_image()
+        with d:
+            raw = bytearray(image.image.read_bytes()); struct.pack_into('<Q', raw, image.read_superblock().lookup_table_start, len(raw) + 1); image.image.write_bytes(raw)
+            self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, SquashFSImage(image.image), end)
+    def test_offsets_must_increase_strictly(self):
+        d, image, end = self.make_lookup_image(1025, offsets=[2000, 1500])
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, end)
+    def test_duplicate_offsets_are_typed_error(self):
+        d, image, end = self.make_lookup_image(1025, offsets=[1000, 1000])
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, end)
+    def test_last_offset_must_precede_index(self):
+        d, image, end = self.make_lookup_image(offsets=[20000], lookup_start=20000)
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, end)
+    def test_adjacent_offset_distance_is_limited(self):
+        d, image, end = self.make_lookup_image(1025, offsets=[1000, 1000 + 8195])
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, end)
+    def test_final_offset_distance_is_limited(self):
+        d, image, end = self.make_lookup_image(offsets=[1000], lookup_start=10000)
+        with d: self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, image, end)
+    def test_unsafe_inode_count_arithmetic_is_bounded_by_image(self):
+        d, image, _ = self.make_lookup_image()
+        with d:
+            raw = bytearray(image.image.read_bytes()); struct.pack_into('<I', raw, 4, 0xffffffff); image.image.write_bytes(raw)
+            self.assertRaises(SquashFSInodeLookupTableError, read_inode_lookup_table, SquashFSImage(image.image))
+
+
+class SquashFSInodeLookupEntryReaderTest(_InodeLookupFixture):
+    def test_missing_table_or_invalid_inode_number_is_typed(self):
+        image = SquashFSImage(ROOTFS); table = read_inode_lookup_table(image)
+        if table is None:
+            with self.assertRaises(Exception): read_inode_lookup_entry(image, table, 1)
+        else:
+            with self.assertRaises(SquashFSInodeLookupIndexError): read_inode_lookup_entry(image, table, 0)
+
+    def test_first_middle_and_last_entries_decode(self):
+        image = SquashFSImage(ROOTFS); table = read_inode_lookup_table(image)
+        for number in (1, table.inode_count // 2, table.inode_count):
+            entry = read_inode_lookup_entry(image, table, number)
+            self.assertEqual((entry.raw_value >> 16, entry.raw_value & 0xffff), (entry.block, entry.offset))
+
+    def test_inode_number_above_range_is_rejected(self):
+        image = SquashFSImage(ROOTFS); table = read_inode_lookup_table(image)
+        with self.assertRaises(SquashFSInodeLookupIndexError): read_inode_lookup_entry(image, table, table.inode_count + 1)
+
+    def test_entry_at_second_metadata_block(self):
+        image = SquashFSImage(ROOTFS); table = read_inode_lookup_table(image)
+        entry = read_inode_lookup_entry(image, table, 1025)
+        self.assertGreaterEqual(entry.block, 0)
+
+    def _table(self, count=1025, **kwargs):
+        d, image, end = self.make_lookup_image(count, **kwargs); return d, image, read_inode_lookup_table(image, end)
+    def test_first_inode_number(self):
+        d,i,t=self._table();
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1).raw_value,0x10000)
+    def test_middle_inode_number(self):
+        d,i,t=self._table();
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,512).raw_value,0x20001ff)
+    def test_last_inode_number(self):
+        d,i,t=self._table();
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1025).raw_value,0x10000)
+    def test_logical_index_is_inode_minus_one(self):
+        d,i,t=self._table();
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,2).offset,1)
+    def test_exact_byte_offset_selects_eighth_entry(self):
+        d,i,t=self._table();
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,8).offset,7)
+    def test_entry_at_block_beginning(self):
+        d,i,t=self._table();
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1025).offset,0)
+    def test_final_aligned_entry_is_in_first_block(self):
+        d,i,t=self._table();
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1024).offset,1023)
+    def test_next_entry_uses_second_metadata_block(self):
+        d,i,t=self._table();
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1025).block,1)
+    def test_little_endian_u64_decoding(self):
+        d,i,t=self._table(1,payloads=[struct.pack('<Q',0x1122334455667788)])
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1).raw_value,0x1122334455667788)
+    def test_reference_block_decoding(self):
+        d,i,t=self._table(1,payloads=[struct.pack('<Q',0x123456780001)])
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1).block,0x12345678)
+    def test_reference_offset_decoding(self):
+        d,i,t=self._table(1,payloads=[struct.pack('<Q',0x1234ffff)])
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1).offset,0xffff)
+    def test_zero_reference_offset(self):
+        d,i,t=self._table(1,payloads=[struct.pack('<Q',0x10000)])
+        with d: self.assertEqual(read_inode_lookup_entry(i,t,1).offset,0)
+    def test_uncompressed_metadata_block(self): self.test_first_inode_number()
+    def test_compressed_metadata_block(self):
+        payload = struct.pack('<Q', 0xabcde0001)
+        compressed = zstandard.ZstdCompressor().compress(payload)
+        d, image, end = self.make_lookup_image(1, payloads=[b''])
+        with d:
+            path = image.image
+            raw = bytearray(path.read_bytes())
+            raw[1024:1026] = struct.pack('<H', len(compressed))
+            raw[1026:1026 + len(compressed)] = compressed
+            path.write_bytes(raw)
+            table = read_inode_lookup_table(image, end)
+            self.assertEqual(read_inode_lookup_entry(image, table, 1).raw_value, 0xabcde0001)
+    def test_malformed_metadata_header_preserves_cause(self):
+        d,i,end=self.make_lookup_image(1,payloads=[b'']);
+        with d:
+            t=read_inode_lookup_table(i,end)
+            with self.assertRaises(SquashFSInodeLookupEntryError) as e: read_inode_lookup_entry(i,t,1)
+            self.assertIsNotNone(e.exception.__cause__)
+    def test_truncated_metadata_payload_is_typed_error(self): self.test_malformed_metadata_header_preserves_cause()
+    def test_truncated_logical_entry_is_typed_error(self):
+        d,i,end=self.make_lookup_image(1,payloads=[b'1234567']);
+        with d:
+            t=read_inode_lookup_table(i,end)
+            with self.assertRaises(SquashFSInodeLookupEntryError): read_inode_lookup_entry(i,t,1)
+    def test_missing_table_is_typed_error(self):
+        d,i,_=self.make_lookup_image()
+        with d: self.assertRaises(SquashFSInodeLookupTableError,read_inode_lookup_entry,i,None,1)
+    def test_invalid_table_index_is_typed_error(self):
+        d,i,t=self._table(1)
+        with d: self.assertRaises(SquashFSInodeLookupIndexError,read_inode_lookup_entry,i,t,2)
+
+
+class SquashFSInodeNumberResolverTest(_InodeLookupFixture):
+    def resolver_fixture(self, *, corrupt_reference=None, truncate_inode=False):
+        """One compact image carries all six inode layouts and its lookup stream."""
+        inodes = [
+            INODE_HEADER_STRUCT.pack(1, 0o755, 0, 0, 0, 1) + BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(0, 2, 3, 0, 1),
+            INODE_HEADER_STRUCT.pack(8, 0o755, 0, 0, 0, 2) + EXTENDED_DIRECTORY_INODE_BODY_STRUCT.pack(2, 3, 0, 1, 0, 0, 0),
+            INODE_HEADER_STRUCT.pack(2, 0o644, 0, 0, 0, 3) + BASIC_REGULAR_INODE_BODY_STRUCT.pack(0, SQUASHFS_INVALID_FRAGMENT, 0, 0),
+            INODE_HEADER_STRUCT.pack(9, 0o644, 0, 0, 0, 4) + EXTENDED_REGULAR_INODE_BODY_STRUCT.pack(0, 0, 0, 1, SQUASHFS_INVALID_FRAGMENT, 0, 0),
+            INODE_HEADER_STRUCT.pack(3, 0o777, 0, 0, 0, 5) + BASIC_SYMLINK_INODE_BODY_STRUCT.pack(1, 0),
+            INODE_HEADER_STRUCT.pack(10, 0o777, 0, 0, 0, 6) + EXTENDED_SYMLINK_INODE_BODY_STRUCT.pack(1, 0, 0),
+        ]
+        positions=[]; payload=bytearray()
+        for raw in inodes:
+            positions.append(len(payload)); payload.extend(raw)
+        if truncate_inode: payload = payload[:-1]
+        lookup_payload = b''.join(struct.pack('<Q', corrupt_reference if corrupt_reference is not None and n == 0 else positions[n]) for n in range(6))
+        directory = tempfile.TemporaryDirectory(); path=Path(directory.name)/'resolver.sqfs'
+        inode_offset=128; lookup_offset=10000; lookup_start=18000; size=lookup_start+8
+        content=bytearray(size)
+        sb=struct.pack('<IIIIIHHHHHHQQQQQQQQ', SQUASHFS_MAGIC,6,0,4096,0,6,12,0,1,4,0,0,size,lookup_start+8,0,inode_offset,0,0,lookup_start)
+        content[:len(sb)]=sb
+        for offset,data in ((inode_offset,bytes(payload)),(lookup_offset,lookup_payload)):
+            content[offset:offset+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(data));content[offset+2:offset+2+len(data)]=data
+        content[lookup_start:lookup_start+8]=struct.pack('<Q',lookup_offset); path.write_bytes(content)
+        image=SquashFSImage(path); table=read_inode_lookup_table(image,lookup_start+8)
+        return directory,image,table,SquashFSMetadataStream(image,inode_offset)
+
+    def _resolve(self, number):
+        d,i,t,s=self.resolver_fixture(); self.addCleanup(d.cleanup); return resolve_inode_number(i,s,t,number)
+
+    def test_resolves_basic_directory_inode(self): self.assertIsInstance(self._resolve(1).body, SquashFSBasicDirectoryInode)
+    def test_resolves_extended_directory_inode(self): self.assertIsInstance(self._resolve(2).body, SquashFSExtendedDirectoryInode)
+    def test_resolves_basic_regular_inode(self): self.assertIsInstance(self._resolve(3).body, SquashFSBasicRegularInode)
+    def test_resolves_extended_regular_inode(self): self.assertIsInstance(self._resolve(4).body, SquashFSExtendedRegularInode)
+    def test_resolves_basic_symlink_inode(self): self.assertIsInstance(self._resolve(5).body, SquashFSBasicSymlinkInode)
+    def test_resolves_extended_symlink_inode(self): self.assertIsInstance(self._resolve(6).body, SquashFSExtendedSymlinkInode)
+    def test_parsed_inode_number_matches_requested(self): self.assertEqual(self._resolve(4).header.inode_number, 4)
+    def test_missing_table_has_exact_error(self):
+        d,i,_,s=self.resolver_fixture()
+        with d: self.assertRaises(SquashFSInodeLookupTableError,resolve_inode_number,i,s,None,1)
+    def test_out_of_range_inode_has_exact_error(self):
+        d,i,t,s=self.resolver_fixture()
+        with d: self.assertRaises(SquashFSInodeLookupIndexError,resolve_inode_number,i,s,t,7)
+    def test_malformed_lookup_entry_is_wrapped_with_cause(self):
+        d,i,t,s=self.resolver_fixture(corrupt_reference=0xffffffffffffffff)
+        with d:
+            with self.assertRaises(SquashFSInodeLookupEntryError) as caught: resolve_inode_number(i,s,t,1)
+            self.assertIsInstance(caught.exception.__cause__, SquashFSMetadataStreamError)
+    def test_invalid_metadata_block_reference_fails(self):
+        d,i,t,s=self.resolver_fixture(corrupt_reference=(0xffff << 16))
+        with d: self.assertRaises(SquashFSInodeLookupEntryError,resolve_inode_number,i,s,t,1)
+    def test_invalid_metadata_offset_reference_fails(self):
+        d,i,t,s=self.resolver_fixture(corrupt_reference=0xffff)
+        with d: self.assertRaises(SquashFSInodeLookupEntryError,resolve_inode_number,i,s,t,1)
+    def test_downstream_parser_failure_is_wrapped_and_chained(self):
+        d,i,t,s=self.resolver_fixture(truncate_inode=True)
+        with d:
+            with self.assertRaises(SquashFSInodeLookupEntryError) as caught: resolve_inode_number(i,s,t,6)
+            self.assertIsInstance(caught.exception.__cause__, SquashFSMetadataStreamError)
+    def test_direct_inode_reference_parser_is_unchanged(self):
+        self.assertEqual(decode_metadata_reference(0x12345678abcd), SquashFSMetadataReference(0x12345678,0xabcd))
+    def test_lookup_table_discovery_is_repeatable(self):
+        image = SquashFSImage(ROOTFS)
+        self.assertEqual(read_inode_lookup_table(image), read_inode_lookup_table(image))
+
+    def test_root_and_first_and_last_inode_numbers_resolve(self):
+        image = SquashFSImage(ROOTFS); superblock = image.read_superblock(); table = read_inode_lookup_table(image)
+        stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        for number in (1, decode_metadata_reference(superblock.root_inode).byte_offset and 2, table.inode_count):
+            inode = resolve_inode_number(image, stream, table, number)
+            self.assertEqual(inode.header.inode_number, number)
+
+    def test_zero_inode_number_is_rejected(self):
+        image = SquashFSImage(ROOTFS); superblock = image.read_superblock(); table = read_inode_lookup_table(image)
+        with self.assertRaises(SquashFSInodeLookupIndexError): resolve_inode_number(image, SquashFSMetadataStream(image, superblock.inode_table_start), table, 0)
 
 
 class SquashFSExtendedDirectoryInodeParserTest(unittest.TestCase):
