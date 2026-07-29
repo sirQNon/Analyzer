@@ -12,6 +12,7 @@ from squashfs import (
     BASIC_DIRECTORY_INODE_SIZE,
     BASIC_DIRECTORY_INODE_TYPE,
     BASIC_REGULAR_INODE_BODY_STRUCT,
+    BASIC_REGULAR_INODE_SIZE,
     BASIC_REGULAR_INODE_TYPE,
     DIRECTORY_ENTRY_SIZE,
     DIRECTORY_ENTRY_STRUCT,
@@ -22,6 +23,10 @@ from squashfs import (
     INODE_HEADER_SIZE,
     INODE_HEADER_STRUCT,
     METADATA_UNCOMPRESSED_BIT,
+    REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE,
+    REGULAR_FILE_BLOCK_SIZE_STRUCT,
+    SQUASHFS_DATA_UNCOMPRESSED_BIT,
+    SQUASHFS_INVALID_FRAGMENT,
     SQUASHFS_MAGIC,
     SquashFSInodeError,
     SquashFSInode,
@@ -33,18 +38,26 @@ from squashfs import (
     SquashFSDirectoryReaderError,
     SquashFSDirectoryRecord,
     SquashFSInodeHeader,
+    SquashFSDataBlockDecompressionError,
+    SquashFSDataBlockSizeError,
+    SquashFSDataBlockTruncatedError,
+    SquashFSFragmentFileUnsupportedError,
+    SquashFSMalformedBlockListError,
     SquashFSImage,
     SquashFSMetadataError,
     SquashFSMetadataReference,
     SquashFSMetadataStream,
     SquashFSMetadataStreamError,
     SquashFSUnsupportedInodeTypeError,
+    basic_regular_file_block_count,
     decode_metadata_reference,
     directory_entry_reference,
     parse_basic_directory_inode,
     parse_directory_entry,
     parse_directory_header,
     parse_inode_header,
+    parse_regular_file_block_size_entry,
+    read_basic_regular_file,
     read_directory,
     read_inode,
 )
@@ -904,6 +917,166 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         self.assertIsInstance(bash_inode.body, SquashFSBasicRegularInode)
         self.assertEqual(bash_inode.header.inode_number, bash_record.inode_number)
         self.assertEqual(bash_inode.header.inode_type, bash_record.inode_type)
+
+
+class SquashFSBasicRegularFileReaderTest(unittest.TestCase):
+    block_size = 16
+    metadata_start = 96
+    data_start = 512
+
+    def make_image(
+        self,
+        metadata_blocks: tuple[bytes, ...],
+        data: bytes,
+    ) -> tuple[tempfile.TemporaryDirectory, SquashFSImage, SquashFSMetadataStream]:
+        directory = tempfile.TemporaryDirectory()
+        path = Path(directory.name) / "regular-file.sqfs"
+        metadata = b"".join(
+            struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(block)) + block
+            for block in metadata_blocks
+        )
+        image_size = max(self.data_start + len(data), self.metadata_start + len(metadata))
+        superblock = struct.pack(
+            "<IIIIIHHHHHHQQQQQQQQ",
+            SQUASHFS_MAGIC, 1, 0, self.block_size, 0, 6, 4, 0, 1, 4, 0,
+            0, image_size, 0, 0, self.metadata_start, 0, 0, 0,
+        )
+        contents = bytearray(image_size)
+        contents[:len(superblock)] = superblock
+        contents[self.metadata_start:self.metadata_start + len(metadata)] = metadata
+        contents[self.data_start:self.data_start + len(data)] = data
+        path.write_bytes(contents)
+        image = SquashFSImage(path)
+        image.read_superblock()
+        return directory, image, SquashFSMetadataStream(image, self.metadata_start)
+
+    def regular_inode_bytes(self, file_size: int, fragment: int = SQUASHFS_INVALID_FRAGMENT) -> bytes:
+        return INODE_HEADER_STRUCT.pack(2, 0o644, 0, 0, 0, 1) + (
+            BASIC_REGULAR_INODE_BODY_STRUCT.pack(self.data_start, fragment, 0, file_size)
+        )
+
+    def read_synthetic(self, metadata_blocks: tuple[bytes, ...], data: bytes) -> bytes:
+        directory, image, stream = self.make_image(metadata_blocks, data)
+        with directory:
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+            return read_basic_regular_file(image, stream, inode)
+
+    def test_parses_regular_file_block_size_entries(self):
+        compressed = parse_regular_file_block_size_entry(
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(7), 16
+        )
+        uncompressed = parse_regular_file_block_size_entry(
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | 16),
+            16,
+        )
+        sparse = parse_regular_file_block_size_entry(
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(0), 5
+        )
+
+        self.assertEqual((compressed.stored_size, compressed.is_uncompressed, compressed.logical_size, compressed.is_sparse), (7, False, 16, False))
+        self.assertEqual((uncompressed.stored_size, uncompressed.is_uncompressed, uncompressed.logical_size, uncompressed.is_sparse), (16, True, 16, False))
+        self.assertEqual((sparse.stored_size, sparse.is_sparse, sparse.logical_size), (0, True, 5))
+
+    def test_rejects_invalid_block_size_entries(self):
+        with self.assertRaises(SquashFSMalformedBlockListError):
+            parse_regular_file_block_size_entry(b"\x00" * 3, 1)
+        with self.assertRaises(SquashFSMalformedBlockListError):
+            parse_regular_file_block_size_entry(struct.pack("<I", 1 << 25), 1)
+        with self.assertRaises(TypeError):
+            parse_regular_file_block_size_entry(bytearray(4), 1)
+
+    def test_block_count_covers_full_blocks_and_fragment_policy(self):
+        self.assertEqual(basic_regular_file_block_count(0, 16, SQUASHFS_INVALID_FRAGMENT), 0)
+        self.assertEqual(basic_regular_file_block_count(5, 16, SQUASHFS_INVALID_FRAGMENT), 1)
+        self.assertEqual(basic_regular_file_block_count(16, 16, SQUASHFS_INVALID_FRAGMENT), 1)
+        self.assertEqual(basic_regular_file_block_count(17, 16, SQUASHFS_INVALID_FRAGMENT), 2)
+        self.assertEqual(basic_regular_file_block_count(17, 16, 0), 1)
+
+    def test_reads_one_uncompressed_regular_file_block(self):
+        payload = b"regular-data"
+        metadata = self.regular_inode_bytes(len(payload)) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(
+            SQUASHFS_DATA_UNCOMPRESSED_BIT | len(payload)
+        )
+        self.assertEqual(self.read_synthetic((metadata,), payload), payload)
+
+    def test_reads_one_compressed_regular_file_block(self):
+        payload = b"compressed data"
+        stored = zstandard.ZstdCompressor().compress(payload)
+        metadata = self.regular_inode_bytes(len(payload)) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(len(stored))
+        self.assertEqual(self.read_synthetic((metadata,), stored), payload)
+
+    def test_reads_multiple_blocks_last_partial_and_sparse_block(self):
+        first = b"a" * 16
+        last = b"z" * 3
+        metadata = self.regular_inode_bytes(35) + b"".join((
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | len(first)),
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(0),
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | len(last)),
+        ))
+        self.assertEqual(self.read_synthetic((metadata,), first + last), first + (b"\x00" * 16) + last)
+
+    def test_reads_block_list_across_metadata_blocks(self):
+        first = b"a" * 16
+        last = b"b" * 2
+        inode = self.regular_inode_bytes(18)
+        first_metadata = inode + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(
+            SQUASHFS_DATA_UNCOMPRESSED_BIT | len(first)
+        )
+        second_metadata = REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(
+            SQUASHFS_DATA_UNCOMPRESSED_BIT | len(last)
+        )
+        self.assertEqual(self.read_synthetic((first_metadata, second_metadata), first + last), first + last)
+
+    def test_data_errors_are_distinct(self):
+        payload = b"abc"
+        truncated = self.regular_inode_bytes(4) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(
+            SQUASHFS_DATA_UNCOMPRESSED_BIT | 4
+        )
+        directory, image, stream = self.make_image((truncated,), payload)
+        with directory:
+            with self.assertRaises(SquashFSDataBlockTruncatedError):
+                read_basic_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0)))
+
+        mismatch = self.regular_inode_bytes(4) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(
+            SQUASHFS_DATA_UNCOMPRESSED_BIT | 3
+        )
+        directory, image, stream = self.make_image((mismatch,), payload)
+        with directory:
+            with self.assertRaises(SquashFSDataBlockSizeError):
+                read_basic_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0)))
+
+        invalid = self.regular_inode_bytes(4) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(3)
+        directory, image, stream = self.make_image((invalid,), b"bad")
+        with directory:
+            with self.assertRaises(SquashFSDataBlockDecompressionError):
+                read_basic_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0)))
+
+    def test_fragment_backed_regular_file_is_rejected_and_empty_file_is_empty(self):
+        fragment_metadata = self.regular_inode_bytes(1, fragment=7)
+        directory, image, stream = self.make_image((fragment_metadata,), b"")
+        with directory:
+            with self.assertRaises(SquashFSFragmentFileUnsupportedError):
+                read_basic_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0)))
+
+        self.assertEqual(self.read_synthetic((self.regular_inode_bytes(0),), b""), b"")
+
+    def test_udm_pro_bash_regular_file_has_elf_magic_and_declared_size(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        inode_stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        directory_stream = SquashFSMetadataStream(image, superblock.directory_table_start)
+        root_inode = inode_stream.read_basic_directory_inode(
+            decode_metadata_reference(superblock.root_inode)
+        )
+        root_records = {record.name: record for record in read_directory(directory_stream, root_inode)}
+        bin_inode = inode_stream.read_basic_directory_inode(root_records[b"bin"].inode_reference)
+        bin_records = {record.name: record for record in read_directory(directory_stream, bin_inode)}
+        bash_inode = read_inode(inode_stream, bin_records[b"bash"].inode_reference)
+
+        data = read_basic_regular_file(image, inode_stream, bash_inode)
+
+        self.assertEqual(data[:4], b"\x7fELF")
+        self.assertEqual(len(data), bash_inode.body.file_size)
 
 
 if __name__ == "__main__":

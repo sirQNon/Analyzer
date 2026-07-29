@@ -25,6 +25,12 @@ BASIC_REGULAR_INODE_TYPE = 2
 BASIC_REGULAR_INODE_BODY_STRUCT = struct.Struct("<IIII")
 BASIC_REGULAR_INODE_BODY_SIZE = BASIC_REGULAR_INODE_BODY_STRUCT.size
 BASIC_REGULAR_INODE_SIZE = INODE_HEADER_SIZE + BASIC_REGULAR_INODE_BODY_SIZE
+REGULAR_FILE_BLOCK_SIZE_STRUCT = struct.Struct("<I")
+REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE = REGULAR_FILE_BLOCK_SIZE_STRUCT.size
+SQUASHFS_INVALID_FRAGMENT = 0xFFFFFFFF
+SQUASHFS_DATA_UNCOMPRESSED_BIT = 1 << 24
+SQUASHFS_DATA_SIZE_MASK = SQUASHFS_DATA_UNCOMPRESSED_BIT - 1
+SQUASHFS_DATA_RESERVED_MASK = 0xFE000000
 DIRECTORY_HEADER_STRUCT = struct.Struct("<III")
 DIRECTORY_HEADER_SIZE = DIRECTORY_HEADER_STRUCT.size
 DIRECTORY_ENTRY_STRUCT = struct.Struct("<HhHH")
@@ -112,6 +118,16 @@ class SquashFSBasicRegularInode:
     file_size: int
 
 
+@dataclass(frozen=True)
+class SquashFSRegularFileBlock:
+    """One decoded basic regular-file block-list entry."""
+
+    stored_size: int
+    is_uncompressed: bool
+    logical_size: int
+    is_sparse: bool
+
+
 SquashFSInodeBody = SquashFSBasicDirectoryInode | SquashFSBasicRegularInode
 
 
@@ -167,6 +183,39 @@ class SquashFSInodeError(ValueError):
 
 class SquashFSUnsupportedInodeTypeError(SquashFSInodeError):
     """A valid SquashFS inode type has no Stage 9 typed parser."""
+
+
+class SquashFSRegularFileError(ValueError):
+    """A basic regular file cannot be decoded safely."""
+
+
+class SquashFSMalformedBlockListError(SquashFSRegularFileError):
+    """A regular-file block-list entry is not a valid SquashFS size."""
+
+
+class SquashFSFragmentFileUnsupportedError(SquashFSRegularFileError):
+    """A basic regular file stores a tail in a fragment block."""
+
+
+class SquashFSDataBlockTruncatedError(SquashFSRegularFileError):
+    """A regular-file data block exceeds the physical image."""
+
+
+class SquashFSDataBlockDecompressionError(SquashFSRegularFileError):
+    """A compressed regular-file data block cannot be decompressed."""
+
+
+class SquashFSDataBlockSizeError(SquashFSRegularFileError):
+    """A regular-file data block has an unexpected logical size."""
+
+
+def _decompress_zstd_payload(payload: bytes, expected_size: int) -> bytes:
+    """Decompress a Zstandard payload to its expected logical size."""
+    return zstandard.ZstdDecompressor().decompress(
+        payload,
+        max_output_size=expected_size,
+    )
+
 
 class SquashFSDirectoryError(ValueError):
     """Invalid or incomplete SquashFS directory structure."""
@@ -291,6 +340,67 @@ def parse_basic_regular_inode_body(
     return SquashFSBasicRegularInode(header, *body)
 
 
+def basic_regular_file_block_count(
+    file_size: int,
+    block_size: int,
+    fragment: int,
+) -> int:
+    """Return the number of block-list entries required by a regular file."""
+    for name, value in (("file size", file_size), ("block size", block_size), ("fragment", fragment)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"Basic regular inode {name} must be an integer")
+
+    if file_size < 0:
+        raise ValueError("Basic regular inode file size must not be negative")
+    if block_size <= 0:
+        raise ValueError("SquashFS block size must be positive")
+    if not 0 <= fragment <= 0xFFFFFFFF:
+        raise ValueError("Basic regular inode fragment is outside the unsigned 32-bit range")
+
+    complete_blocks, remainder = divmod(file_size, block_size)
+    if fragment == SQUASHFS_INVALID_FRAGMENT and remainder:
+        return complete_blocks + 1
+    return complete_blocks
+
+
+def parse_regular_file_block_size_entry(
+    data: bytes,
+    logical_size: int,
+) -> SquashFSRegularFileBlock:
+    """Decode one 32-bit basic regular-file block-list entry without I/O."""
+    if not isinstance(data, bytes):
+        raise TypeError("Regular-file block-list entry must be bytes")
+    if not isinstance(logical_size, int) or isinstance(logical_size, bool):
+        raise TypeError("Regular-file block logical size must be an integer")
+    if logical_size <= 0:
+        raise ValueError("Regular-file block logical size must be positive")
+    if len(data) < REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE:
+        raise SquashFSMalformedBlockListError(
+            "Regular-file block-list entry is shorter than "
+            f"{REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE} bytes"
+        )
+
+    try:
+        encoded_size = REGULAR_FILE_BLOCK_SIZE_STRUCT.unpack_from(data)[0]
+    except struct.error as error:
+        raise SquashFSMalformedBlockListError(
+            "Cannot unpack regular-file block-list entry"
+        ) from error
+
+    if encoded_size & SQUASHFS_DATA_RESERVED_MASK:
+        raise SquashFSMalformedBlockListError(
+            f"Regular-file block-list entry has reserved bits: {encoded_size:#010x}"
+        )
+
+    stored_size = encoded_size & SQUASHFS_DATA_SIZE_MASK
+    return SquashFSRegularFileBlock(
+        stored_size=stored_size,
+        is_uncompressed=bool(encoded_size & SQUASHFS_DATA_UNCOMPRESSED_BIT),
+        logical_size=logical_size,
+        is_sparse=stored_size == 0,
+    )
+
+
 INODE_BODY_PARSERS = {
     BASIC_DIRECTORY_INODE_TYPE: (
         BASIC_DIRECTORY_INODE_BODY_SIZE,
@@ -322,10 +432,7 @@ def read_inode(
         )
 
     body_size, parser = parser_entry
-    body_reference = SquashFSMetadataReference(
-        block_offset=reference.block_offset,
-        byte_offset=reference.byte_offset + INODE_HEADER_SIZE,
-    )
+    body_reference = stream.advance_reference(reference, INODE_HEADER_SIZE)
     body = parser(header, stream.read(body_reference, body_size))
     return SquashFSInode(reference=reference, header=header, body=body)
 
@@ -540,10 +647,7 @@ class SquashFSImage:
 
         if is_compressed:
             try:
-                data = zstandard.ZstdDecompressor().decompress(
-                    payload,
-                    max_output_size=METADATA_SIZE,
-                )
+                data = _decompress_zstd_payload(payload, METADATA_SIZE)
             except zstandard.ZstdError as error:
                 raise SquashFSMetadataError(
                     f"Invalid ZSTD metadata payload at {offset:#x}"
@@ -563,6 +667,58 @@ class SquashFSImage:
             data=data,
             next_offset=next_offset,
         )
+
+    def read_regular_data_block(
+        self,
+        offset: int,
+        block: SquashFSRegularFileBlock,
+    ) -> bytes:
+        """Read one ordinary regular-file data block at an absolute image offset."""
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise TypeError("Regular-file data offset must be an integer")
+        if not isinstance(block, SquashFSRegularFileBlock):
+            raise TypeError("Regular-file block descriptor has an invalid type")
+        if offset < 0:
+            raise SquashFSDataBlockTruncatedError(
+                f"Regular-file data offset must not be negative: {offset}"
+            )
+        if block.is_sparse:
+            return b"\x00" * block.logical_size
+
+        image_size = self.image.stat().st_size
+        end_offset = offset + block.stored_size
+        if end_offset > image_size:
+            raise SquashFSDataBlockTruncatedError(
+                "Regular-file data block exceeds image: "
+                f"offset {offset:#x}, stored size {block.stored_size}"
+            )
+
+        with self.image.open("rb") as source:
+            source.seek(offset)
+            payload = source.read(block.stored_size)
+
+        if len(payload) != block.stored_size:
+            raise SquashFSDataBlockTruncatedError(
+                "Regular-file data block is truncated: "
+                f"expected {block.stored_size} bytes, got {len(payload)}"
+            )
+
+        if block.is_uncompressed:
+            data = payload
+        else:
+            try:
+                data = _decompress_zstd_payload(payload, block.logical_size)
+            except zstandard.ZstdError as error:
+                raise SquashFSDataBlockDecompressionError(
+                    f"Invalid ZSTD regular-file data block at {offset:#x}"
+                ) from error
+
+        if len(data) != block.logical_size:
+            raise SquashFSDataBlockSizeError(
+                "Regular-file data block logical size mismatch: "
+                f"expected {block.logical_size}, got {len(data)}"
+            )
+        return data
 
 
 class SquashFSMetadataStream:
@@ -625,6 +781,48 @@ class SquashFSMetadataStream:
 
         return b"".join(parts)
 
+    def advance_reference(
+        self,
+        reference: SquashFSMetadataReference,
+        delta: int,
+    ) -> SquashFSMetadataReference:
+        """Advance in decompressed metadata bytes, not physical block offsets."""
+        if not isinstance(reference, SquashFSMetadataReference):
+            raise TypeError("Metadata stream reference has an invalid type")
+        if not isinstance(delta, int) or isinstance(delta, bool):
+            raise TypeError("Metadata stream delta must be an integer")
+        if delta < 0:
+            raise ValueError("Metadata stream delta must not be negative")
+
+        current_offset = self.table_start + reference.block_offset
+        current_byte_offset = reference.byte_offset
+        remaining = delta
+
+        while True:
+            try:
+                block = self.image.read_metadata_block(current_offset)
+            except SquashFSMetadataError as error:
+                raise SquashFSMetadataStreamError(
+                    f"Cannot read metadata block at {current_offset:#x}"
+                ) from error
+
+            if current_byte_offset > len(block.data):
+                raise SquashFSMetadataStreamError(
+                    "Metadata offset exceeds decompressed block: "
+                    f"offset {current_byte_offset}, block size {len(block.data)}"
+                )
+
+            available = len(block.data) - current_byte_offset
+            if remaining <= available:
+                return SquashFSMetadataReference(
+                    block_offset=current_offset - self.table_start,
+                    byte_offset=current_byte_offset + remaining,
+                )
+
+            remaining -= available
+            current_offset = block.next_offset
+            current_byte_offset = 0
+
     def read_inode_header(self, reference: int) -> SquashFSInodeHeader:
         """Read and decode only the fixed common inode header."""
         metadata_reference = decode_metadata_reference(reference)
@@ -638,3 +836,77 @@ class SquashFSMetadataStream:
         """Read and decode only a basic directory inode."""
         data = self.read(reference, BASIC_DIRECTORY_INODE_SIZE)
         return parse_basic_directory_inode(data)
+
+
+def read_basic_regular_file(
+    image: SquashFSImage,
+    metadata_stream: SquashFSMetadataStream,
+    inode: SquashFSInode,
+) -> bytes:
+    """Read all ordinary data blocks of one fragment-free basic regular file."""
+    if not isinstance(image, SquashFSImage):
+        raise TypeError("SquashFS image has an invalid type")
+    if not isinstance(metadata_stream, SquashFSMetadataStream):
+        raise TypeError("Regular-file metadata stream has an invalid type")
+    if not isinstance(inode, SquashFSInode):
+        raise TypeError("Regular-file inode has an invalid type")
+    if metadata_stream.image is not image:
+        raise ValueError("Regular-file metadata stream belongs to another image")
+    if not isinstance(inode.body, SquashFSBasicRegularInode):
+        raise SquashFSRegularFileError("Typed inode is not a basic regular file")
+
+    regular_inode = inode.body
+    if regular_inode.fragment != SQUASHFS_INVALID_FRAGMENT:
+        raise SquashFSFragmentFileUnsupportedError(
+            "Fragment-backed basic regular file is unsupported: "
+            f"inode {regular_inode.header.inode_number}, fragment {regular_inode.fragment}"
+        )
+
+    superblock = image.superblock or image.read_superblock()
+    entry_count = basic_regular_file_block_count(
+        regular_inode.file_size,
+        superblock.block_size,
+        regular_inode.fragment,
+    )
+    if entry_count == 0:
+        return b""
+
+    list_reference = metadata_stream.advance_reference(
+        inode.reference,
+        BASIC_REGULAR_INODE_SIZE,
+    )
+    list_data = metadata_stream.read(
+        list_reference,
+        entry_count * REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE,
+    )
+    blocks: list[SquashFSRegularFileBlock] = []
+    remaining = regular_inode.file_size
+    for index in range(entry_count):
+        logical_size = min(superblock.block_size, remaining)
+        entry_offset = index * REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE
+        block = parse_regular_file_block_size_entry(
+            list_data[entry_offset:],
+            logical_size,
+        )
+        blocks.append(block)
+        remaining -= logical_size
+
+    if remaining != 0:
+        raise SquashFSRegularFileError(
+            "Regular-file block list does not cover declared file size: "
+            f"remaining {remaining}"
+        )
+
+    data_offset = regular_inode.start_block
+    parts: list[bytes] = []
+    for block in blocks:
+        parts.append(image.read_regular_data_block(data_offset, block))
+        data_offset += block.stored_size
+
+    result = b"".join(parts)
+    if len(result) != regular_inode.file_size:
+        raise SquashFSRegularFileError(
+            "Regular-file result size mismatch: "
+            f"expected {regular_inode.file_size}, got {len(result)}"
+        )
+    return result
