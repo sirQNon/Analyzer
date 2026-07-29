@@ -26,6 +26,9 @@ from squashfs import (
     INODE_HEADER_SIZE,
     INODE_HEADER_STRUCT,
     METADATA_UNCOMPRESSED_BIT,
+    FRAGMENT_ENTRY_STRUCT,
+    FRAGMENT_ENTRIES_PER_METADATA_BLOCK,
+    FRAGMENT_INDEX_POINTER_STRUCT,
     REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE,
     REGULAR_FILE_BLOCK_SIZE_STRUCT,
     SQUASHFS_DATA_UNCOMPRESSED_BIT,
@@ -46,6 +49,11 @@ from squashfs import (
     SquashFSDataBlockSizeError,
     SquashFSDataBlockTruncatedError,
     SquashFSFragmentFileUnsupportedError,
+    SquashFSFragmentBlockError,
+    SquashFSFragmentEntry,
+    SquashFSFragmentEntryError,
+    SquashFSFragmentIndexError,
+    SquashFSFragmentTable,
     SquashFSMalformedBlockListError,
     SquashFSImage,
     SquashFSMetadataError,
@@ -55,10 +63,12 @@ from squashfs import (
     SquashFSUnsupportedInodeTypeError,
     SquashFSSymlinkError,
     basic_regular_file_block_count,
+    fragment_index_count,
     decode_metadata_reference,
     directory_entry_reference,
     parse_basic_directory_inode,
     parse_basic_symlink_inode,
+    parse_fragment_entry,
     parse_directory_entry,
     parse_directory_header,
     parse_inode_header,
@@ -1159,6 +1169,76 @@ class BasicSymlinkReaderTest(unittest.TestCase):
 
         self.assertIsInstance(symlink_inode.body, SquashFSBasicSymlinkInode)
         self.assertEqual(read_basic_symlink(inode_stream, symlink_inode), "dash")
+
+
+class SquashFSFragmentTableReaderTest(unittest.TestCase):
+    metadata_start = 128
+    index_start = 4096
+    data_start = 8192
+
+    def make_image(self, entries, blocks, pointers=None):
+        directory = tempfile.TemporaryDirectory()
+        path = Path(directory.name) / "fragments.sqfs"
+        metadata = []
+        pointers = pointers or [self.metadata_start]
+        for entry_bytes in entries:
+            metadata.append(struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(entry_bytes)) + entry_bytes)
+        index = b"".join(FRAGMENT_INDEX_POINTER_STRUCT.pack(value) for value in pointers)
+        size = max(self.data_start + sum(len(block) for block in blocks), self.index_start + len(index), self.metadata_start + sum(len(block) for block in metadata))
+        superblock = struct.pack("<IIIIIHHHHHHQQQQQQQQ", SQUASHFS_MAGIC, len(entries) * FRAGMENT_ENTRIES_PER_METADATA_BLOCK, 0, 64, len(entries) * FRAGMENT_ENTRIES_PER_METADATA_BLOCK, 6, 6, 0, 1, 4, 0, 0, size, 0, 0, 0, 0, self.index_start, 0)
+        contents = bytearray(size)
+        contents[:len(superblock)] = superblock
+        offset = self.metadata_start
+        for block in metadata:
+            contents[offset:offset + len(block)] = block
+            offset += len(block)
+        contents[self.index_start:self.index_start + len(index)] = index
+        offset = self.data_start
+        for block in blocks:
+            contents[offset:offset + len(block)] = block
+            offset += len(block)
+        path.write_bytes(contents)
+        image = SquashFSImage(path); image.read_superblock()
+        return directory, image
+
+    def test_parse_and_size_fields(self):
+        entry = parse_fragment_entry(FRAGMENT_ENTRY_STRUCT.pack(7, SQUASHFS_DATA_UNCOMPRESSED_BIT | 3, 0))
+        self.assertEqual((entry.start_block, entry.stored_size, entry.is_uncompressed), (7, 3, True))
+        self.assertFalse(parse_fragment_entry(FRAGMENT_ENTRY_STRUCT.pack(7, 3, 0)).is_uncompressed)
+        with self.assertRaises(SquashFSFragmentEntryError): parse_fragment_entry(b"\0" * 15)
+
+    def test_index_count_and_zero_fragments(self):
+        self.assertEqual(fragment_index_count(0), 0)
+        self.assertEqual(fragment_index_count(1), 1)
+        self.assertEqual(fragment_index_count(FRAGMENT_ENTRIES_PER_METADATA_BLOCK + 1), 2)
+
+    def test_reads_uncompressed_and_compressed_blocks(self):
+        raw = b"fragment"
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        entries = [FRAGMENT_ENTRY_STRUCT.pack(self.data_start, SQUASHFS_DATA_UNCOMPRESSED_BIT | len(raw), 0)]
+        directory, image = self.make_image([b"".join(entries)], [raw])
+        with directory: self.assertEqual(SquashFSFragmentTable(image).read_block(0), raw)
+        entries = [FRAGMENT_ENTRY_STRUCT.pack(self.data_start, len(compressed), 0)]
+        directory, image = self.make_image([b"".join(entries)], [compressed])
+        with directory: self.assertEqual(SquashFSFragmentTable(image).read_block(0), raw)
+
+    def test_rejects_bad_indexes_pointers_and_blocks(self):
+        entry = FRAGMENT_ENTRY_STRUCT.pack(self.data_start, SQUASHFS_DATA_UNCOMPRESSED_BIT | 4, 0)
+        directory, image = self.make_image([entry], [b"abc"])
+        with directory:
+            table = SquashFSFragmentTable(image)
+            with self.assertRaises(SquashFSFragmentIndexError): table.read_entry(-1)
+            with self.assertRaises(SquashFSFragmentIndexError): table.read_entry(FRAGMENT_ENTRIES_PER_METADATA_BLOCK)
+            with self.assertRaises(SquashFSFragmentBlockError): table.read_block(0)
+
+    def test_rootfs_fragment_entries_and_blocks(self):
+        image = SquashFSImage(ROOTFS); superblock = image.read_superblock(); table = SquashFSFragmentTable(image)
+        self.assertGreater(superblock.fragment_count, 0)
+        for index in (0, superblock.fragment_count // 2, superblock.fragment_count - 1):
+            self.assertIsInstance(table.read_entry(index), SquashFSFragmentEntry)
+            data = table.read_block(index)
+            self.assertTrue(data)
+            self.assertLessEqual(len(data), superblock.block_size)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,11 @@ SQUASHFS_INVALID_FRAGMENT = 0xFFFFFFFF
 SQUASHFS_DATA_UNCOMPRESSED_BIT = 1 << 24
 SQUASHFS_DATA_SIZE_MASK = SQUASHFS_DATA_UNCOMPRESSED_BIT - 1
 SQUASHFS_DATA_RESERVED_MASK = 0xFE000000
+FRAGMENT_ENTRY_STRUCT = struct.Struct("<QII")
+FRAGMENT_ENTRY_SIZE = FRAGMENT_ENTRY_STRUCT.size
+FRAGMENT_ENTRIES_PER_METADATA_BLOCK = METADATA_SIZE // FRAGMENT_ENTRY_SIZE
+FRAGMENT_INDEX_POINTER_STRUCT = struct.Struct("<Q")
+FRAGMENT_INDEX_POINTER_SIZE = FRAGMENT_INDEX_POINTER_STRUCT.size
 DIRECTORY_HEADER_STRUCT = struct.Struct("<III")
 DIRECTORY_HEADER_SIZE = DIRECTORY_HEADER_STRUCT.size
 DIRECTORY_ENTRY_STRUCT = struct.Struct("<HhHH")
@@ -129,6 +134,25 @@ class SquashFSBasicSymlinkInode:
     header: SquashFSInodeHeader
     nlink: int
     symlink_size: int
+
+
+@dataclass(frozen=True)
+class SquashFSFragmentEntry:
+    """One on-disk SquashFS v4 fragment-table entry."""
+
+    start_block: int
+    size: int
+    unused: int
+
+    @property
+    def stored_size(self) -> int:
+        """Return the physical fragment payload size."""
+        return self.size & SQUASHFS_DATA_SIZE_MASK
+
+    @property
+    def is_uncompressed(self) -> bool:
+        """Whether the fragment payload is stored without compression."""
+        return bool(self.size & SQUASHFS_DATA_UNCOMPRESSED_BIT)
 
 
 @dataclass(frozen=True)
@@ -228,6 +252,22 @@ class SquashFSDataBlockSizeError(SquashFSRegularFileError):
 
 class SquashFSSymlinkError(Exception):
     """A basic symbolic-link inode or target cannot be read safely."""
+
+
+class SquashFSFragmentError(Exception):
+    """A SquashFS fragment table or data block cannot be read safely."""
+
+
+class SquashFSFragmentIndexError(SquashFSFragmentError):
+    """A fragment-table index or index pointer is invalid."""
+
+
+class SquashFSFragmentEntryError(SquashFSFragmentError):
+    """A fragment-table entry is malformed or unavailable."""
+
+
+class SquashFSFragmentBlockError(SquashFSFragmentError):
+    """A fragment data block is malformed, truncated, or cannot be decoded."""
 
 
 def _decompress_zstd_payload(payload: bytes, expected_size: int) -> bytes:
@@ -463,6 +503,34 @@ def parse_regular_file_block_size_entry(
         logical_size=logical_size,
         is_sparse=stored_size == 0,
     )
+
+
+def fragment_index_count(fragment_count: int) -> int:
+    """Return the number of fragment-table index pointers for ``fragment_count``."""
+    if not isinstance(fragment_count, int) or isinstance(fragment_count, bool):
+        raise TypeError("Fragment count must be an integer")
+    if not 0 <= fragment_count <= 0xFFFFFFFF:
+        raise SquashFSFragmentIndexError("Fragment count is outside the unsigned 32-bit range")
+    return (fragment_count + FRAGMENT_ENTRIES_PER_METADATA_BLOCK - 1) // FRAGMENT_ENTRIES_PER_METADATA_BLOCK
+
+
+def parse_fragment_entry(data: bytes) -> SquashFSFragmentEntry:
+    """Decode one 16-byte fragment-table entry without I/O."""
+    if not isinstance(data, bytes):
+        raise TypeError("Fragment entry data must be bytes")
+    if len(data) < FRAGMENT_ENTRY_SIZE:
+        raise SquashFSFragmentEntryError(
+            f"Fragment entry requires {FRAGMENT_ENTRY_SIZE} bytes: got {len(data)}"
+        )
+    try:
+        entry = SquashFSFragmentEntry(*FRAGMENT_ENTRY_STRUCT.unpack_from(data))
+    except struct.error as error:
+        raise SquashFSFragmentEntryError("Cannot unpack fragment entry") from error
+    if entry.size & SQUASHFS_DATA_RESERVED_MASK:
+        raise SquashFSFragmentEntryError(
+            f"Fragment entry has reserved size bits: {entry.size:#010x}"
+        )
+    return entry
 
 
 INODE_BODY_PARSERS = {
@@ -787,6 +855,117 @@ class SquashFSImage:
                 f"expected {block.logical_size}, got {len(data)}"
             )
         return data
+
+    def read_fragment_block(self, entry: SquashFSFragmentEntry) -> bytes:
+        """Read and decode one complete fragment data block."""
+        if not isinstance(entry, SquashFSFragmentEntry):
+            raise TypeError("Fragment entry has an invalid type")
+        superblock = self.superblock or self.read_superblock()
+        image_size = self.image.stat().st_size
+        stored_size = entry.stored_size
+        end_offset = entry.start_block + stored_size
+        if stored_size == 0 or end_offset > image_size:
+            raise SquashFSFragmentBlockError(
+                "Fragment data block exceeds image: "
+                f"offset {entry.start_block:#x}, stored size {stored_size}"
+            )
+
+        with self.image.open("rb") as source:
+            source.seek(entry.start_block)
+            payload = source.read(stored_size)
+        if len(payload) != stored_size:
+            raise SquashFSFragmentBlockError(
+                "Fragment data block is truncated: "
+                f"expected {stored_size} bytes, got {len(payload)}"
+            )
+
+        if entry.is_uncompressed:
+            data = payload
+        else:
+            try:
+                data = _decompress_zstd_payload(payload, superblock.block_size)
+            except zstandard.ZstdError as error:
+                raise SquashFSFragmentBlockError(
+                    f"Invalid ZSTD fragment payload at {entry.start_block:#x}"
+                ) from error
+
+        if not 0 < len(data) <= superblock.block_size:
+            raise SquashFSFragmentBlockError(
+                "Fragment data block decoded size is outside the permitted range: "
+                f"{len(data)}"
+            )
+        return data
+
+
+class SquashFSFragmentTable:
+    """Look up SquashFS fragment entries using the fragment-table index."""
+
+    def __init__(self, image: SquashFSImage):
+        if not isinstance(image, SquashFSImage):
+            raise TypeError("Fragment table image has an invalid type")
+        self.image = image
+
+    def _index_pointers(self) -> tuple[int, ...]:
+        superblock = self.image.superblock or self.image.read_superblock()
+        count = fragment_index_count(superblock.fragment_count)
+        if count == 0:
+            return ()
+
+        index_size = count * FRAGMENT_INDEX_POINTER_SIZE
+        image_size = self.image.image.stat().st_size
+        index_end = superblock.fragment_table_start + index_size
+        if index_end > image_size:
+            raise SquashFSFragmentIndexError("Fragment table index exceeds image")
+
+        with self.image.image.open("rb") as source:
+            source.seek(superblock.fragment_table_start)
+            data = source.read(index_size)
+        if len(data) != index_size:
+            raise SquashFSFragmentIndexError("Fragment table index is truncated")
+
+        pointers = tuple(
+            FRAGMENT_INDEX_POINTER_STRUCT.unpack_from(data, offset)[0]
+            for offset in range(0, index_size, FRAGMENT_INDEX_POINTER_SIZE)
+        )
+        for pointer in pointers:
+            if pointer >= superblock.fragment_table_start or pointer >= image_size:
+                raise SquashFSFragmentIndexError(
+                    f"Fragment metadata pointer is invalid: {pointer:#x}"
+                )
+        return pointers
+
+    def read_entry(self, index: int) -> SquashFSFragmentEntry:
+        """Return the typed fragment entry at ``index``."""
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("Fragment index must be an integer")
+        superblock = self.image.superblock or self.image.read_superblock()
+        if index < 0 or index >= superblock.fragment_count:
+            raise SquashFSFragmentIndexError(f"Fragment index out of range: {index}")
+
+        block_index, entry_index = divmod(index, FRAGMENT_ENTRIES_PER_METADATA_BLOCK)
+        pointers = self._index_pointers()
+        try:
+            metadata_start = pointers[block_index]
+        except IndexError as error:
+            raise SquashFSFragmentIndexError(
+                f"Fragment index pointer is unavailable: {block_index}"
+            ) from error
+
+        stream = SquashFSMetadataStream(self.image, metadata_start)
+        try:
+            data = stream.read(
+                SquashFSMetadataReference(0, entry_index * FRAGMENT_ENTRY_SIZE),
+                FRAGMENT_ENTRY_SIZE,
+            )
+        except (SquashFSMetadataError, SquashFSMetadataStreamError) as error:
+            raise SquashFSFragmentEntryError(
+                f"Cannot read fragment entry {index}"
+            ) from error
+        return parse_fragment_entry(data)
+
+    def read_block(self, index: int) -> bytes:
+        """Read the complete decoded fragment data block at ``index``."""
+        return self.image.read_fragment_block(self.read_entry(index))
 
 
 class SquashFSMetadataStream:
