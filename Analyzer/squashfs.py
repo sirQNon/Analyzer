@@ -25,6 +25,10 @@ BASIC_REGULAR_INODE_TYPE = 2
 BASIC_REGULAR_INODE_BODY_STRUCT = struct.Struct("<IIII")
 BASIC_REGULAR_INODE_BODY_SIZE = BASIC_REGULAR_INODE_BODY_STRUCT.size
 BASIC_REGULAR_INODE_SIZE = INODE_HEADER_SIZE + BASIC_REGULAR_INODE_BODY_SIZE
+BASIC_SYMLINK_INODE_TYPE = 3
+BASIC_SYMLINK_INODE_BODY_STRUCT = struct.Struct("<II")
+BASIC_SYMLINK_INODE_BODY_SIZE = BASIC_SYMLINK_INODE_BODY_STRUCT.size
+BASIC_SYMLINK_INODE_SIZE = INODE_HEADER_SIZE + BASIC_SYMLINK_INODE_BODY_SIZE
 REGULAR_FILE_BLOCK_SIZE_STRUCT = struct.Struct("<I")
 REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE = REGULAR_FILE_BLOCK_SIZE_STRUCT.size
 SQUASHFS_INVALID_FRAGMENT = 0xFFFFFFFF
@@ -119,6 +123,15 @@ class SquashFSBasicRegularInode:
 
 
 @dataclass(frozen=True)
+class SquashFSBasicSymlinkInode:
+    """The on-disk SquashFS v4 basic symbolic-link inode."""
+
+    header: SquashFSInodeHeader
+    nlink: int
+    symlink_size: int
+
+
+@dataclass(frozen=True)
 class SquashFSRegularFileBlock:
     """One decoded basic regular-file block-list entry."""
 
@@ -128,7 +141,11 @@ class SquashFSRegularFileBlock:
     is_sparse: bool
 
 
-SquashFSInodeBody = SquashFSBasicDirectoryInode | SquashFSBasicRegularInode
+SquashFSInodeBody = (
+    SquashFSBasicDirectoryInode
+    | SquashFSBasicRegularInode
+    | SquashFSBasicSymlinkInode
+)
 
 
 @dataclass(frozen=True)
@@ -207,6 +224,10 @@ class SquashFSDataBlockDecompressionError(SquashFSRegularFileError):
 
 class SquashFSDataBlockSizeError(SquashFSRegularFileError):
     """A regular-file data block has an unexpected logical size."""
+
+
+class SquashFSSymlinkError(Exception):
+    """A basic symbolic-link inode or target cannot be read safely."""
 
 
 def _decompress_zstd_payload(payload: bytes, expected_size: int) -> bytes:
@@ -340,6 +361,49 @@ def parse_basic_regular_inode_body(
     return SquashFSBasicRegularInode(header, *body)
 
 
+def parse_basic_symlink_inode(data: bytes) -> SquashFSBasicSymlinkInode:
+    """Decode only a basic symbolic-link inode from its on-disk bytes."""
+    if not isinstance(data, bytes):
+        raise TypeError("Basic symlink inode data must be bytes")
+
+    if len(data) < BASIC_SYMLINK_INODE_SIZE:
+        raise SquashFSInodeError(
+            "Basic symlink inode is shorter than "
+            f"{BASIC_SYMLINK_INODE_SIZE} bytes: got {len(data)}"
+        )
+
+    header = parse_inode_header(data)
+    return parse_basic_symlink_inode_body(header, data[INODE_HEADER_SIZE:])
+
+
+def parse_basic_symlink_inode_body(
+    header: SquashFSInodeHeader,
+    data: bytes,
+) -> SquashFSBasicSymlinkInode:
+    """Decode the basic symlink body immediately following ``header``."""
+    if not isinstance(header, SquashFSInodeHeader):
+        raise TypeError("Basic symlink inode header has an invalid type")
+    if not isinstance(data, bytes):
+        raise TypeError("Basic symlink inode body data must be bytes")
+    if len(data) < BASIC_SYMLINK_INODE_BODY_SIZE:
+        raise SquashFSInodeError(
+            "Basic symlink inode body is shorter than "
+            f"{BASIC_SYMLINK_INODE_BODY_SIZE} bytes: got {len(data)}"
+        )
+    if header.inode_type != BASIC_SYMLINK_INODE_TYPE:
+        raise SquashFSInodeError(
+            "Basic symlink inode type mismatch: "
+            f"expected {BASIC_SYMLINK_INODE_TYPE}, got {header.inode_type}"
+        )
+
+    try:
+        body = BASIC_SYMLINK_INODE_BODY_STRUCT.unpack_from(data)
+    except struct.error as error:
+        raise SquashFSInodeError("Cannot unpack basic symlink inode body") from error
+
+    return SquashFSBasicSymlinkInode(header, *body)
+
+
 def basic_regular_file_block_count(
     file_size: int,
     block_size: int,
@@ -409,6 +473,10 @@ INODE_BODY_PARSERS = {
     BASIC_REGULAR_INODE_TYPE: (
         BASIC_REGULAR_INODE_BODY_SIZE,
         parse_basic_regular_inode_body,
+    ),
+    BASIC_SYMLINK_INODE_TYPE: (
+        BASIC_SYMLINK_INODE_BODY_SIZE,
+        parse_basic_symlink_inode_body,
     ),
 }
 
@@ -910,3 +978,30 @@ def read_basic_regular_file(
             f"expected {regular_inode.file_size}, got {len(result)}"
         )
     return result
+
+
+def read_basic_symlink(
+    metadata_stream: SquashFSMetadataStream,
+    inode: SquashFSInode,
+) -> str:
+    """Read and UTF-8 decode the target of one basic symbolic-link inode."""
+    if not isinstance(metadata_stream, SquashFSMetadataStream):
+        raise TypeError("Symlink metadata stream has an invalid type")
+    if not isinstance(inode, SquashFSInode):
+        raise TypeError("Symlink inode has an invalid type")
+    if not isinstance(inode.body, SquashFSBasicSymlinkInode):
+        raise SquashFSSymlinkError("Typed inode is not a basic symbolic link")
+
+    target_reference = metadata_stream.advance_reference(
+        inode.reference,
+        BASIC_SYMLINK_INODE_SIZE,
+    )
+    try:
+        target = metadata_stream.read(target_reference, inode.body.symlink_size)
+    except SquashFSMetadataStreamError as error:
+        raise SquashFSSymlinkError("Basic symlink target is truncated") from error
+
+    try:
+        return target.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SquashFSSymlinkError("Basic symlink target is not valid UTF-8") from error

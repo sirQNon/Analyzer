@@ -14,6 +14,9 @@ from squashfs import (
     BASIC_REGULAR_INODE_BODY_STRUCT,
     BASIC_REGULAR_INODE_SIZE,
     BASIC_REGULAR_INODE_TYPE,
+    BASIC_SYMLINK_INODE_BODY_STRUCT,
+    BASIC_SYMLINK_INODE_SIZE,
+    BASIC_SYMLINK_INODE_TYPE,
     DIRECTORY_ENTRY_SIZE,
     DIRECTORY_ENTRY_STRUCT,
     DIRECTORY_HEADER_SIZE,
@@ -32,6 +35,7 @@ from squashfs import (
     SquashFSInode,
     SquashFSBasicDirectoryInode,
     SquashFSBasicRegularInode,
+    SquashFSBasicSymlinkInode,
     SquashFSDirectoryEntry,
     SquashFSDirectoryError,
     SquashFSDirectoryHeader,
@@ -49,15 +53,18 @@ from squashfs import (
     SquashFSMetadataStream,
     SquashFSMetadataStreamError,
     SquashFSUnsupportedInodeTypeError,
+    SquashFSSymlinkError,
     basic_regular_file_block_count,
     decode_metadata_reference,
     directory_entry_reference,
     parse_basic_directory_inode,
+    parse_basic_symlink_inode,
     parse_directory_entry,
     parse_directory_header,
     parse_inode_header,
     parse_regular_file_block_size_entry,
     read_basic_regular_file,
+    read_basic_symlink,
     read_directory,
     read_inode,
 )
@@ -803,6 +810,12 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         )
 
     @staticmethod
+    def symlink_inode_bytes(inode_number: int) -> bytes:
+        return INODE_HEADER_STRUCT.pack(3, 0o777, 0, 0, 0, inode_number) + (
+            BASIC_SYMLINK_INODE_BODY_STRUCT.pack(1, 4)
+        )
+
+    @staticmethod
     def stream_for(payload: bytes) -> tuple[tempfile.TemporaryDirectory, SquashFSMetadataStream]:
         directory = tempfile.TemporaryDirectory()
         image_path = Path(directory.name) / "inodes.bin"
@@ -845,6 +858,15 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         self.assertIsInstance(inode.body, SquashFSBasicRegularInode)
         self.assertEqual((inode.body.start_block, inode.body.fragment, inode.body.offset, inode.body.file_size), (6, 7, 8, 9))
 
+    def test_dispatches_basic_symlink_inode_after_generic_header(self):
+        directory, stream = self.stream_for(self.symlink_inode_bytes(12))
+        with directory:
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+
+        self.assertIsInstance(inode.body, SquashFSBasicSymlinkInode)
+        self.assertEqual(inode.header, SquashFSInodeHeader(3, 0o777, 0, 0, 0, 12))
+        self.assertEqual((inode.body.nlink, inode.body.symlink_size), (1, 4))
+
     def test_reads_inode_body_from_next_metadata_block(self):
         header = INODE_HEADER_STRUCT.pack(2, 0o644, 0, 0, 0, 12)
         body = BASIC_REGULAR_INODE_BODY_STRUCT.pack(10, 11, 12, 13)
@@ -859,7 +881,7 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         self.assertEqual(inode.body, SquashFSBasicRegularInode(inode.header, 10, 11, 12, 13))
 
     def test_unsupported_known_and_unknown_types_are_distinct_data_errors(self):
-        for inode_type in (3, 99):
+        for inode_type in (9, 99):
             directory, stream = self.stream_for(INODE_HEADER_STRUCT.pack(inode_type, 0, 0, 0, 0, 1))
             with directory:
                 with self.assertRaisesRegex(SquashFSUnsupportedInodeTypeError, str(inode_type)):
@@ -1077,6 +1099,66 @@ class SquashFSBasicRegularFileReaderTest(unittest.TestCase):
 
         self.assertEqual(data[:4], b"\x7fELF")
         self.assertEqual(len(data), bash_inode.body.file_size)
+
+
+class BasicSymlinkReaderTest(unittest.TestCase):
+    @staticmethod
+    def stream_for(payload: bytes) -> tuple[tempfile.TemporaryDirectory, SquashFSMetadataStream]:
+        directory = tempfile.TemporaryDirectory()
+        image_path = Path(directory.name) / "symlink-inodes.bin"
+        image_path.write_bytes(
+            struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(payload)) + payload
+        )
+        return directory, SquashFSMetadataStream(SquashFSImage(image_path), 0)
+
+    @staticmethod
+    def inode_bytes(target: bytes, declared_size: int | None = None) -> bytes:
+        target_size = len(target) if declared_size is None else declared_size
+        return (
+            INODE_HEADER_STRUCT.pack(BASIC_SYMLINK_INODE_TYPE, 0o777, 0, 0, 0, 1)
+            + BASIC_SYMLINK_INODE_BODY_STRUCT.pack(1, target_size)
+            + target
+        )
+
+    def read_synthetic(self, target: bytes, declared_size: int | None = None) -> str:
+        directory, stream = self.stream_for(self.inode_bytes(target, declared_size))
+        with directory:
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+            return read_basic_symlink(stream, inode)
+
+    def test_parses_and_reads_basic_symlink_target(self):
+        inode = parse_basic_symlink_inode(self.inode_bytes(b"../lib/target"))
+
+        self.assertIsInstance(inode, SquashFSBasicSymlinkInode)
+        self.assertEqual((inode.nlink, inode.symlink_size), (1, 13))
+        self.assertEqual(self.read_synthetic(b"../lib/target"), "../lib/target")
+
+    def test_reads_empty_target(self):
+        self.assertEqual(self.read_synthetic(b""), "")
+
+    def test_rejects_invalid_utf8_target(self):
+        with self.assertRaises(SquashFSSymlinkError):
+            self.read_synthetic(b"\xff")
+
+    def test_rejects_target_with_unavailable_declared_length(self):
+        with self.assertRaises(SquashFSSymlinkError):
+            self.read_synthetic(b"short", declared_size=6)
+
+    def test_udm_pro_bin_sh_basic_symlink_target(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        inode_stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        directory_stream = SquashFSMetadataStream(image, superblock.directory_table_start)
+        root_inode = inode_stream.read_basic_directory_inode(
+            decode_metadata_reference(superblock.root_inode)
+        )
+        root_records = {record.name: record for record in read_directory(directory_stream, root_inode)}
+        bin_inode = inode_stream.read_basic_directory_inode(root_records[b"bin"].inode_reference)
+        bin_records = {record.name: record for record in read_directory(directory_stream, bin_inode)}
+        symlink_inode = read_inode(inode_stream, bin_records[b"sh"].inode_reference)
+
+        self.assertIsInstance(symlink_inode.body, SquashFSBasicSymlinkInode)
+        self.assertEqual(read_basic_symlink(inode_stream, symlink_inode), "dash")
 
 
 if __name__ == "__main__":
