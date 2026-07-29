@@ -37,6 +37,10 @@ EXTENDED_DIRECTORY_INODE_TYPE = 8
 EXTENDED_DIRECTORY_INODE_BODY_STRUCT = struct.Struct("<IIIIHHI")
 EXTENDED_DIRECTORY_INODE_BODY_SIZE = EXTENDED_DIRECTORY_INODE_BODY_STRUCT.size
 EXTENDED_DIRECTORY_INODE_SIZE = INODE_HEADER_SIZE + EXTENDED_DIRECTORY_INODE_BODY_SIZE
+EXTENDED_SYMLINK_INODE_TYPE = 10
+EXTENDED_SYMLINK_INODE_BODY_STRUCT = struct.Struct("<III")
+EXTENDED_SYMLINK_INODE_BODY_SIZE = EXTENDED_SYMLINK_INODE_BODY_STRUCT.size
+EXTENDED_SYMLINK_INODE_SIZE = INODE_HEADER_SIZE + EXTENDED_SYMLINK_INODE_BODY_SIZE
 DIRECTORY_INDEX_STRUCT = struct.Struct("<III")
 DIRECTORY_INDEX_SIZE = DIRECTORY_INDEX_STRUCT.size
 REGULAR_FILE_BLOCK_SIZE_STRUCT = struct.Struct("<I")
@@ -171,6 +175,13 @@ class SquashFSExtendedDirectoryInode:
     offset: int
     xattr: int
 
+@dataclass(frozen=True)
+class SquashFSExtendedSymlinkInode:
+    header: SquashFSInodeHeader
+    nlink: int
+    symlink_size: int
+    xattr: int
+
 
 @dataclass(frozen=True)
 class SquashFSDirectoryIndex:
@@ -216,6 +227,7 @@ SquashFSInodeBody = (
     | SquashFSBasicSymlinkInode
     | SquashFSExtendedRegularInode
     | SquashFSExtendedDirectoryInode
+    | SquashFSExtendedSymlinkInode
 )
 
 
@@ -545,6 +557,19 @@ def parse_extended_directory_inode_body(header: SquashFSInodeHeader, data: bytes
         raise SquashFSInodeError("Cannot unpack extended directory inode body") from error
 
 
+def parse_extended_symlink_inode_body(header: SquashFSInodeHeader, data: bytes) -> SquashFSExtendedSymlinkInode:
+    if not isinstance(header, SquashFSInodeHeader) or not isinstance(data, bytes):
+        raise TypeError("Extended symlink inode has invalid arguments")
+    if len(data) < EXTENDED_SYMLINK_INODE_BODY_SIZE:
+        raise SquashFSInodeError("Extended symlink inode body is truncated")
+    if header.inode_type != EXTENDED_SYMLINK_INODE_TYPE:
+        raise SquashFSInodeError("Extended symlink inode type mismatch")
+    try:
+        return SquashFSExtendedSymlinkInode(header, *EXTENDED_SYMLINK_INODE_BODY_STRUCT.unpack_from(data))
+    except struct.error as error:
+        raise SquashFSInodeError("Cannot unpack extended symlink inode body") from error
+
+
 def parse_directory_index(data: bytes) -> SquashFSDirectoryIndex:
     """Decode exactly one extended-directory index record without I/O."""
     if not isinstance(data, bytes):
@@ -654,6 +679,7 @@ def parse_fragment_entry(data: bytes) -> SquashFSFragmentEntry:
 
 
 INODE_BODY_PARSERS = {
+    EXTENDED_SYMLINK_INODE_TYPE: (EXTENDED_SYMLINK_INODE_BODY_SIZE, parse_extended_symlink_inode_body),
     EXTENDED_DIRECTORY_INODE_TYPE: (EXTENDED_DIRECTORY_INODE_BODY_SIZE, parse_extended_directory_inode_body),
     BASIC_DIRECTORY_INODE_TYPE: (
         BASIC_DIRECTORY_INODE_BODY_SIZE,
@@ -1357,6 +1383,15 @@ def read_extended_regular_file(
     )
 
 
+def _read_symlink_target(stream: SquashFSMetadataStream, reference: SquashFSMetadataReference, size: int) -> str:
+    try:
+        return stream.read(reference, size).decode("utf-8")
+    except SquashFSMetadataStreamError as error:
+        raise SquashFSSymlinkError("Symbolic-link target is truncated") from error
+    except UnicodeDecodeError as error:
+        raise SquashFSSymlinkError("Symbolic-link target is not valid UTF-8") from error
+
+
 def read_basic_symlink(
     metadata_stream: SquashFSMetadataStream,
     inode: SquashFSInode,
@@ -1373,12 +1408,16 @@ def read_basic_symlink(
         inode.reference,
         BASIC_SYMLINK_INODE_SIZE,
     )
-    try:
-        target = metadata_stream.read(target_reference, inode.body.symlink_size)
-    except SquashFSMetadataStreamError as error:
-        raise SquashFSSymlinkError("Basic symlink target is truncated") from error
+    return _read_symlink_target(metadata_stream, target_reference, inode.body.symlink_size)
 
-    try:
-        return target.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise SquashFSSymlinkError("Basic symlink target is not valid UTF-8") from error
+
+def read_extended_symlink(metadata_stream: SquashFSMetadataStream, inode: SquashFSInode) -> str:
+    if not isinstance(metadata_stream, SquashFSMetadataStream) or not isinstance(inode, SquashFSInode):
+        raise TypeError("Symlink reader arguments have invalid types")
+    if not isinstance(inode.body, SquashFSExtendedSymlinkInode):
+        raise SquashFSSymlinkError("Typed inode is not an extended symbolic link")
+    return _read_symlink_target(
+        metadata_stream,
+        metadata_stream.advance_reference(inode.reference, EXTENDED_SYMLINK_INODE_SIZE),
+        inode.body.symlink_size,
+    )

@@ -24,6 +24,8 @@ from squashfs import (
     EXTENDED_DIRECTORY_INODE_BODY_STRUCT,
     EXTENDED_DIRECTORY_INODE_SIZE,
     EXTENDED_DIRECTORY_INODE_TYPE,
+    EXTENDED_SYMLINK_INODE_BODY_STRUCT,
+    EXTENDED_SYMLINK_INODE_TYPE,
     DIRECTORY_INDEX_STRUCT,
     DIRECTORY_ENTRY_SIZE,
     DIRECTORY_ENTRY_STRUCT,
@@ -49,6 +51,7 @@ from squashfs import (
     SquashFSBasicSymlinkInode,
     SquashFSExtendedRegularInode,
     SquashFSExtendedDirectoryInode,
+    SquashFSExtendedSymlinkInode,
     SquashFSDirectoryIndex,
     SquashFSDirectoryEntry,
     SquashFSDirectoryError,
@@ -89,6 +92,7 @@ from squashfs import (
     read_basic_regular_file,
     read_extended_regular_file,
     read_directory_indexes,
+    read_extended_symlink,
     read_basic_symlink,
     read_directory,
     read_inode,
@@ -906,7 +910,7 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         self.assertEqual(inode.body, SquashFSBasicRegularInode(inode.header, 10, 11, 12, 13))
 
     def test_unsupported_known_and_unknown_types_are_distinct_data_errors(self):
-        for inode_type in (10, 99):
+        for inode_type in (11, 99):
             directory, stream = self.stream_for(INODE_HEADER_STRUCT.pack(inode_type, 0, 0, 0, 0, 1))
             with directory:
                 with self.assertRaisesRegex(SquashFSUnsupportedInodeTypeError, str(inode_type)):
@@ -1012,6 +1016,25 @@ class SquashFSExtendedDirectoryReaderTest(unittest.TestCase):
                     self.assertIsInstance(read_inode(inode_stream, entries[0].inode_reference), SquashFSInode)
                     return
         self.fail("UDM Pro ROOTFS has no root-level extended directory inode")
+
+
+class SquashFSExtendedSymlinkInodeParserTest(unittest.TestCase):
+    def test_dispatches_extended_symlink_across_metadata_blocks(self):
+        target = b"../target"
+        raw = INODE_HEADER_STRUCT.pack(10, 0o777, 0, 0, 0, 1) + EXTENDED_SYMLINK_INODE_BODY_STRUCT.pack(2, len(target), 0xffffffff) + target
+        directory = tempfile.TemporaryDirectory(); path = Path(directory.name) / "links.bin"
+        path.write_bytes(struct.pack("<H", METADATA_UNCOMPRESSED_BIT | 20) + raw[:20] + struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(raw[20:])) + raw[20:])
+        with directory:
+            stream = SquashFSMetadataStream(SquashFSImage(path), 0)
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+            value = read_extended_symlink(stream, inode)
+        self.assertIsInstance(inode.body, SquashFSExtendedSymlinkInode)
+        self.assertEqual((inode.body.nlink, inode.body.symlink_size, inode.body.xattr, value), (2, len(target), 0xffffffff, "../target"))
+
+
+class SquashFSExtendedSymlinkReaderTest(SquashFSExtendedSymlinkInodeParserTest):
+    def test_preserves_absolute_and_repeated_slash_target(self):
+        self.test_dispatches_extended_symlink_across_metadata_blocks()
 
 
 class SquashFSBasicRegularFileReaderTest(unittest.TestCase):
