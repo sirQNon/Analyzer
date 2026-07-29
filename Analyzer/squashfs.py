@@ -29,6 +29,10 @@ BASIC_SYMLINK_INODE_TYPE = 3
 BASIC_SYMLINK_INODE_BODY_STRUCT = struct.Struct("<II")
 BASIC_SYMLINK_INODE_BODY_SIZE = BASIC_SYMLINK_INODE_BODY_STRUCT.size
 BASIC_SYMLINK_INODE_SIZE = INODE_HEADER_SIZE + BASIC_SYMLINK_INODE_BODY_SIZE
+EXTENDED_REGULAR_INODE_TYPE = 9
+EXTENDED_REGULAR_INODE_BODY_STRUCT = struct.Struct("<QQQIIII")
+EXTENDED_REGULAR_INODE_BODY_SIZE = EXTENDED_REGULAR_INODE_BODY_STRUCT.size
+EXTENDED_REGULAR_INODE_SIZE = INODE_HEADER_SIZE + EXTENDED_REGULAR_INODE_BODY_SIZE
 REGULAR_FILE_BLOCK_SIZE_STRUCT = struct.Struct("<I")
 REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE = REGULAR_FILE_BLOCK_SIZE_STRUCT.size
 SQUASHFS_INVALID_FRAGMENT = 0xFFFFFFFF
@@ -137,6 +141,19 @@ class SquashFSBasicSymlinkInode:
 
 
 @dataclass(frozen=True)
+class SquashFSExtendedRegularInode:
+    """The on-disk SquashFS v4 extended regular-file inode."""
+    header: SquashFSInodeHeader
+    start_block: int
+    file_size: int
+    sparse: int
+    nlink: int
+    fragment: int
+    offset: int
+    xattr: int
+
+
+@dataclass(frozen=True)
 class SquashFSFragmentEntry:
     """One on-disk SquashFS v4 fragment-table entry."""
 
@@ -169,6 +186,7 @@ SquashFSInodeBody = (
     SquashFSBasicDirectoryInode
     | SquashFSBasicRegularInode
     | SquashFSBasicSymlinkInode
+    | SquashFSExtendedRegularInode
 )
 
 
@@ -443,6 +461,42 @@ def parse_basic_symlink_inode_body(
     return SquashFSBasicSymlinkInode(header, *body)
 
 
+def parse_extended_regular_inode(data: bytes) -> SquashFSExtendedRegularInode:
+    """Decode one complete extended regular-file inode without I/O."""
+    if not isinstance(data, bytes):
+        raise TypeError("Extended regular inode data must be bytes")
+    if len(data) < EXTENDED_REGULAR_INODE_SIZE:
+        raise SquashFSInodeError(
+            "Extended regular inode is shorter than "
+            f"{EXTENDED_REGULAR_INODE_SIZE} bytes: got {len(data)}"
+        )
+    header = parse_inode_header(data)
+    return parse_extended_regular_inode_body(header, data[INODE_HEADER_SIZE:])
+
+
+def parse_extended_regular_inode_body(
+    header: SquashFSInodeHeader,
+    data: bytes,
+) -> SquashFSExtendedRegularInode:
+    """Decode the extended regular-file body immediately following ``header``."""
+    if not isinstance(header, SquashFSInodeHeader):
+        raise TypeError("Extended regular inode header has an invalid type")
+    if not isinstance(data, bytes):
+        raise TypeError("Extended regular inode body data must be bytes")
+    if len(data) < EXTENDED_REGULAR_INODE_BODY_SIZE:
+        raise SquashFSInodeError(
+            "Extended regular inode body is shorter than "
+            f"{EXTENDED_REGULAR_INODE_BODY_SIZE} bytes: got {len(data)}"
+        )
+    if header.inode_type != EXTENDED_REGULAR_INODE_TYPE:
+        raise SquashFSInodeError("Extended regular inode type mismatch")
+    try:
+        body = EXTENDED_REGULAR_INODE_BODY_STRUCT.unpack_from(data)
+    except struct.error as error:
+        raise SquashFSInodeError("Cannot unpack extended regular inode body") from error
+    return SquashFSExtendedRegularInode(header, *body)
+
+
 def basic_regular_file_block_count(
     file_size: int,
     block_size: int,
@@ -544,6 +598,10 @@ INODE_BODY_PARSERS = {
     BASIC_SYMLINK_INODE_TYPE: (
         BASIC_SYMLINK_INODE_BODY_SIZE,
         parse_basic_symlink_inode_body,
+    ),
+    EXTENDED_REGULAR_INODE_TYPE: (
+        EXTENDED_REGULAR_INODE_BODY_SIZE,
+        parse_extended_regular_inode_body,
     ),
 }
 
@@ -1084,6 +1142,68 @@ class SquashFSMetadataStream:
         return parse_basic_directory_inode(data)
 
 
+def _read_regular_file(
+    image: SquashFSImage,
+    metadata_stream: SquashFSMetadataStream,
+    *,
+    start_block: int,
+    file_size: int,
+    fragment: int,
+    offset: int,
+    block_list_reference: SquashFSMetadataReference,
+) -> bytes:
+    """Assemble a basic or extended regular file from its explicit fields."""
+    superblock = image.superblock or image.read_superblock()
+    tail_size = file_size % superblock.block_size
+    if fragment != SQUASHFS_INVALID_FRAGMENT and tail_size == 0:
+        raise SquashFSFragmentTailError("Regular-file fragment has no tail")
+    entry_count = basic_regular_file_block_count(file_size, superblock.block_size, fragment)
+    if entry_count == 0 and fragment == SQUASHFS_INVALID_FRAGMENT:
+        return b""
+
+    list_data = metadata_stream.read(
+        block_list_reference, entry_count * REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE
+    )
+    blocks: list[SquashFSRegularFileBlock] = []
+    remaining = file_size
+    for index in range(entry_count):
+        logical_size = min(superblock.block_size, remaining)
+        entry_offset = index * REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE
+        blocks.append(parse_regular_file_block_size_entry(list_data[entry_offset:], logical_size))
+        remaining -= logical_size
+
+    expected_remaining = tail_size if fragment != SQUASHFS_INVALID_FRAGMENT else 0
+    if remaining != expected_remaining:
+        raise SquashFSRegularFileError(
+            "Regular-file block list does not cover declared file size: "
+            f"remaining {remaining}"
+        )
+
+    data_offset = start_block
+    parts: list[bytes] = []
+    for block in blocks:
+        parts.append(image.read_regular_data_block(data_offset, block))
+        data_offset += block.stored_size
+
+    if fragment != SQUASHFS_INVALID_FRAGMENT:
+        try:
+            fragment_block = SquashFSFragmentTable(image).read_block(fragment)
+        except SquashFSFragmentError as error:
+            raise SquashFSFragmentTailError("Cannot read regular-file fragment") from error
+        fragment_end = offset + tail_size
+        if offset > len(fragment_block) or fragment_end > len(fragment_block):
+            raise SquashFSFragmentTailError("Regular-file fragment tail exceeds fragment block")
+        parts.append(fragment_block[offset:fragment_end])
+
+    result = b"".join(parts)
+    if len(result) != file_size:
+        raise SquashFSRegularFileError(
+            "Regular-file result size mismatch: "
+            f"expected {file_size}, got {len(result)}"
+        )
+    return result
+
+
 def read_basic_regular_file(
     image: SquashFSImage,
     metadata_stream: SquashFSMetadataStream,
@@ -1102,68 +1222,48 @@ def read_basic_regular_file(
         raise SquashFSRegularFileError("Typed inode is not a basic regular file")
 
     regular_inode = inode.body
-    superblock = image.superblock or image.read_superblock()
-    tail_size = regular_inode.file_size % superblock.block_size
-    if regular_inode.fragment != SQUASHFS_INVALID_FRAGMENT and tail_size == 0:
-        raise SquashFSFragmentTailError("Regular-file fragment has no tail")
-    entry_count = basic_regular_file_block_count(
-        regular_inode.file_size,
-        superblock.block_size,
-        regular_inode.fragment,
-    )
-    if entry_count == 0 and regular_inode.fragment == SQUASHFS_INVALID_FRAGMENT:
-        return b""
-
-    list_reference = metadata_stream.advance_reference(
+    return _read_regular_file(
+        image,
+        metadata_stream,
+        start_block=regular_inode.start_block,
+        file_size=regular_inode.file_size,
+        fragment=regular_inode.fragment,
+        offset=regular_inode.offset,
+        block_list_reference=metadata_stream.advance_reference(
         inode.reference,
         BASIC_REGULAR_INODE_SIZE,
+        ),
     )
-    list_data = metadata_stream.read(
-        list_reference,
-        entry_count * REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE,
+
+
+def read_extended_regular_file(
+    image: SquashFSImage,
+    metadata_stream: SquashFSMetadataStream,
+    inode: SquashFSInode,
+) -> bytes:
+    """Read all data blocks and an optional fragment tail of an extended file."""
+    if not isinstance(image, SquashFSImage):
+        raise TypeError("SquashFS image has an invalid type")
+    if not isinstance(metadata_stream, SquashFSMetadataStream):
+        raise TypeError("Regular-file metadata stream has an invalid type")
+    if not isinstance(inode, SquashFSInode):
+        raise TypeError("Regular-file inode has an invalid type")
+    if metadata_stream.image is not image:
+        raise ValueError("Regular-file metadata stream belongs to another image")
+    if not isinstance(inode.body, SquashFSExtendedRegularInode):
+        raise SquashFSRegularFileError("Typed inode is not an extended regular file")
+    regular_inode = inode.body
+    return _read_regular_file(
+        image,
+        metadata_stream,
+        start_block=regular_inode.start_block,
+        file_size=regular_inode.file_size,
+        fragment=regular_inode.fragment,
+        offset=regular_inode.offset,
+        block_list_reference=metadata_stream.advance_reference(
+            inode.reference, EXTENDED_REGULAR_INODE_SIZE
+        ),
     )
-    blocks: list[SquashFSRegularFileBlock] = []
-    remaining = regular_inode.file_size
-    for index in range(entry_count):
-        logical_size = min(superblock.block_size, remaining)
-        entry_offset = index * REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE
-        block = parse_regular_file_block_size_entry(
-            list_data[entry_offset:],
-            logical_size,
-        )
-        blocks.append(block)
-        remaining -= logical_size
-
-    expected_remaining = tail_size if regular_inode.fragment != SQUASHFS_INVALID_FRAGMENT else 0
-    if remaining != expected_remaining:
-        raise SquashFSRegularFileError(
-            "Regular-file block list does not cover declared file size: "
-            f"remaining {remaining}"
-        )
-
-    data_offset = regular_inode.start_block
-    parts: list[bytes] = []
-    for block in blocks:
-        parts.append(image.read_regular_data_block(data_offset, block))
-        data_offset += block.stored_size
-
-    if regular_inode.fragment != SQUASHFS_INVALID_FRAGMENT:
-        try:
-            fragment_block = SquashFSFragmentTable(image).read_block(regular_inode.fragment)
-        except SquashFSFragmentError as error:
-            raise SquashFSFragmentTailError("Cannot read regular-file fragment") from error
-        fragment_end = regular_inode.offset + tail_size
-        if regular_inode.offset > len(fragment_block) or fragment_end > len(fragment_block):
-            raise SquashFSFragmentTailError("Regular-file fragment tail exceeds fragment block")
-        parts.append(fragment_block[regular_inode.offset:fragment_end])
-
-    result = b"".join(parts)
-    if len(result) != regular_inode.file_size:
-        raise SquashFSRegularFileError(
-            "Regular-file result size mismatch: "
-            f"expected {regular_inode.file_size}, got {len(result)}"
-        )
-    return result
 
 
 def read_basic_symlink(

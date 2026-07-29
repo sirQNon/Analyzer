@@ -18,6 +18,9 @@ from squashfs import (
     BASIC_SYMLINK_INODE_BODY_STRUCT,
     BASIC_SYMLINK_INODE_SIZE,
     BASIC_SYMLINK_INODE_TYPE,
+    EXTENDED_REGULAR_INODE_BODY_STRUCT,
+    EXTENDED_REGULAR_INODE_SIZE,
+    EXTENDED_REGULAR_INODE_TYPE,
     DIRECTORY_ENTRY_SIZE,
     DIRECTORY_ENTRY_STRUCT,
     DIRECTORY_HEADER_SIZE,
@@ -40,6 +43,7 @@ from squashfs import (
     SquashFSBasicDirectoryInode,
     SquashFSBasicRegularInode,
     SquashFSBasicSymlinkInode,
+    SquashFSExtendedRegularInode,
     SquashFSDirectoryEntry,
     SquashFSDirectoryError,
     SquashFSDirectoryHeader,
@@ -69,12 +73,14 @@ from squashfs import (
     directory_entry_reference,
     parse_basic_directory_inode,
     parse_basic_symlink_inode,
+    parse_extended_regular_inode,
     parse_fragment_entry,
     parse_directory_entry,
     parse_directory_header,
     parse_inode_header,
     parse_regular_file_block_size_entry,
     read_basic_regular_file,
+    read_extended_regular_file,
     read_basic_symlink,
     read_directory,
     read_inode,
@@ -892,7 +898,7 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         self.assertEqual(inode.body, SquashFSBasicRegularInode(inode.header, 10, 11, 12, 13))
 
     def test_unsupported_known_and_unknown_types_are_distinct_data_errors(self):
-        for inode_type in (9, 99):
+        for inode_type in (8, 99):
             directory, stream = self.stream_for(INODE_HEADER_STRUCT.pack(inode_type, 0, 0, 0, 0, 1))
             with directory:
                 with self.assertRaisesRegex(SquashFSUnsupportedInodeTypeError, str(inode_type)):
@@ -1110,6 +1116,117 @@ class SquashFSBasicRegularFileReaderTest(unittest.TestCase):
 
         self.assertEqual(data[:4], b"\x7fELF")
         self.assertEqual(len(data), bash_inode.body.file_size)
+
+
+class SquashFSExtendedRegularInodeParserTest(unittest.TestCase):
+    def inode_bytes(self, *, start_block=0x1_0000_0200, file_size=0x1_0000_0011,
+                    sparse=0x1_0000_0000, nlink=3, fragment=7, offset=9, xattr=11):
+        return INODE_HEADER_STRUCT.pack(EXTENDED_REGULAR_INODE_TYPE, 0o644, 1, 2, 3, 4) + (
+            EXTENDED_REGULAR_INODE_BODY_STRUCT.pack(start_block, file_size, sparse, nlink, fragment, offset, xattr)
+        )
+
+    def test_parses_all_fields_and_fixed_size(self):
+        inode = parse_extended_regular_inode(self.inode_bytes())
+        self.assertIsInstance(inode, SquashFSExtendedRegularInode)
+        self.assertEqual(len(self.inode_bytes()), EXTENDED_REGULAR_INODE_SIZE)
+        self.assertEqual((inode.start_block, inode.file_size, inode.sparse, inode.nlink, inode.fragment, inode.offset, inode.xattr),
+                         (0x1_0000_0200, 0x1_0000_0011, 0x1_0000_0000, 3, 7, 9, 11))
+        self.assertEqual(parse_extended_regular_inode(self.inode_bytes(fragment=SQUASHFS_INVALID_FRAGMENT)).fragment, SQUASHFS_INVALID_FRAGMENT)
+
+    def test_truncated_and_type_mismatch_are_typed(self):
+        with self.assertRaises(SquashFSInodeError):
+            parse_extended_regular_inode(self.inode_bytes()[:-1])
+        with self.assertRaises(SquashFSInodeError):
+            parse_extended_regular_inode(INODE_HEADER_STRUCT.pack(2, 0, 0, 0, 0, 0) + b"\0" * 40)
+
+    def test_dispatcher_reads_boundary_crossing_extended_inode(self):
+        helper = SquashFSBasicRegularFileReaderTest()
+        raw = self.inode_bytes(start_block=helper.data_start, file_size=0)
+        directory, image, stream = helper.make_image((raw[:20], raw[20:]), b"")
+        with directory:
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+        self.assertIsInstance(inode.body, SquashFSExtendedRegularInode)
+        self.assertEqual(inode.body.file_size, 0)
+
+
+class SquashFSExtendedRegularFileReaderTest(unittest.TestCase):
+    helper = SquashFSBasicRegularFileReaderTest()
+
+    def inode_bytes(self, file_size, fragment=SQUASHFS_INVALID_FRAGMENT, offset=0):
+        return INODE_HEADER_STRUCT.pack(EXTENDED_REGULAR_INODE_TYPE, 0o644, 0, 0, 0, 1) + (
+            EXTENDED_REGULAR_INODE_BODY_STRUCT.pack(self.helper.data_start, file_size, 0, 1, fragment, offset, 0)
+        )
+
+    def read_synthetic(self, metadata_blocks, data, fragment_data=None):
+        directory, image, stream = self.helper.make_image(metadata_blocks, data)
+        with directory:
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+            if fragment_data is None:
+                return read_extended_regular_file(image, stream, inode)
+            with patch("squashfs.SquashFSFragmentTable") as table_type:
+                table_type.return_value.read_block.return_value = fragment_data
+                return read_extended_regular_file(image, stream, inode)
+
+    def test_empty_uncompressed_compressed_and_sparse_files(self):
+        self.assertEqual(self.read_synthetic((self.inode_bytes(0),), b""), b"")
+        raw = b"x" * 16
+        plain = self.inode_bytes(16) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | 16)
+        self.assertEqual(self.read_synthetic((plain,), raw), raw)
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        packed = self.inode_bytes(16) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(len(compressed))
+        self.assertEqual(self.read_synthetic((packed,), compressed), raw)
+        sparse = self.inode_bytes(16) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(0)
+        self.assertEqual(self.read_synthetic((sparse,), b""), b"\0" * 16)
+
+    def test_fragment_only_and_mixed_block_fragment_assembly(self):
+        self.assertEqual(self.read_synthetic((self.inode_bytes(3, 0),), b"", b"abc"), b"abc")
+        full = b"a" * 16
+        metadata = self.inode_bytes(35, 0) + b"".join((
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | 16),
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(0),
+        ))
+        self.assertEqual(self.read_synthetic((metadata,), full, b"end"), full + b"\0" * 16 + b"end")
+
+    def test_error_contracts_and_basic_reader_regression(self):
+        bad_tail = self.inode_bytes(3, SQUASHFS_INVALID_FRAGMENT)
+        with self.assertRaises(SquashFSDataBlockTruncatedError):
+            self.read_synthetic((bad_tail + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | 3),), b"ab")
+        directory, image, stream = self.helper.make_image((self.inode_bytes(3, 0),), b"")
+        error = SquashFSFragmentIndexError("outside")
+        with directory, patch("squashfs.SquashFSFragmentTable") as table_type:
+            table_type.return_value.read_block.side_effect = error
+            with self.assertRaises(SquashFSFragmentTailError) as raised:
+                read_extended_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0)))
+        self.assertIs(raised.exception.__cause__, error)
+
+    def test_rootfs_extended_regular_inode_is_readable(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        inode_stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        directory_stream = SquashFSMetadataStream(image, superblock.directory_table_start)
+        pending = [inode_stream.read_basic_directory_inode(decode_metadata_reference(superblock.root_inode))]
+        seen = set()
+        extended = []
+        while pending:
+            for record in read_directory(directory_stream, pending.pop()):
+                if record.inode_reference in seen or record.name in (b".", b".."):
+                    continue
+                seen.add(record.inode_reference)
+                child_header = parse_inode_header(
+                    inode_stream.read(record.inode_reference, INODE_HEADER_SIZE)
+                )
+                if child_header.inode_type == BASIC_DIRECTORY_INODE_TYPE:
+                    pending.append(inode_stream.read_basic_directory_inode(record.inode_reference))
+                elif child_header.inode_type == EXTENDED_REGULAR_INODE_TYPE:
+                    inode = read_inode(inode_stream, record.inode_reference)
+                    self.assertIsInstance(inode.body, SquashFSExtendedRegularInode)
+                    extended.append(inode)
+        self.assertTrue(extended, "UDM Pro ROOTFS has no extended regular inode (type 9)")
+        inode = extended[0]
+        self.assertEqual(
+            len(read_extended_regular_file(image, inode_stream, inode)),
+            inode.body.file_size,
+        )
 
 
 class BasicSymlinkReaderTest(unittest.TestCase):
