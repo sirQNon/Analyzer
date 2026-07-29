@@ -3,6 +3,7 @@
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import zstandard
@@ -48,7 +49,7 @@ from squashfs import (
     SquashFSDataBlockDecompressionError,
     SquashFSDataBlockSizeError,
     SquashFSDataBlockTruncatedError,
-    SquashFSFragmentFileUnsupportedError,
+    SquashFSFragmentTailError,
     SquashFSFragmentBlockError,
     SquashFSFragmentEntry,
     SquashFSFragmentEntryError,
@@ -1083,11 +1084,11 @@ class SquashFSBasicRegularFileReaderTest(unittest.TestCase):
             with self.assertRaises(SquashFSDataBlockDecompressionError):
                 read_basic_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0)))
 
-    def test_fragment_backed_regular_file_is_rejected_and_empty_file_is_empty(self):
+    def test_missing_fragment_data_is_rejected_and_empty_file_is_empty(self):
         fragment_metadata = self.regular_inode_bytes(1, fragment=7)
         directory, image, stream = self.make_image((fragment_metadata,), b"")
         with directory:
-            with self.assertRaises(SquashFSFragmentFileUnsupportedError):
+            with self.assertRaises(SquashFSFragmentTailError):
                 read_basic_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0)))
 
         self.assertEqual(self.read_synthetic((self.regular_inode_bytes(0),), b""), b"")
@@ -1239,6 +1240,114 @@ class SquashFSFragmentTableReaderTest(unittest.TestCase):
             data = table.read_block(index)
             self.assertTrue(data)
             self.assertLessEqual(len(data), superblock.block_size)
+
+
+class SquashFSFragmentBackedRegularFileReaderTest(unittest.TestCase):
+    helper = SquashFSBasicRegularFileReaderTest()
+
+    def read_with_fragment(self, file_size, fragment_data, offset=0, blocks=b"", error=None):
+        metadata = self.helper.regular_inode_bytes(file_size, fragment=0) 
+        if blocks:
+            metadata += REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | len(blocks))
+        directory, image, stream = self.helper.make_image((metadata,), blocks)
+        with directory, patch("squashfs.SquashFSFragmentTable") as table_type:
+            table_type.return_value.read_block.return_value = fragment_data
+            table_type.return_value.read_block.side_effect = error
+            inode = read_inode(stream, SquashFSMetadataReference(0, 0))
+            inode = SquashFSInode(inode.reference, inode.header, SquashFSBasicRegularInode(inode.body.header, inode.body.start_block, 0, offset, inode.body.file_size))
+            return read_basic_regular_file(image, stream, inode)
+
+    def test_synthetic_fragment_assembly_and_offsets(self):
+        self.assertEqual(self.read_with_fragment(3, b"abc"), b"abc")
+        self.assertEqual(self.read_with_fragment(19, b"xxend", 2, b"a" * 16), b"a" * 16 + b"end")
+        self.assertEqual(self.read_with_fragment(3, b"abc", 0), b"abc")
+
+    def test_synthetic_fragment_range_and_table_errors(self):
+        with self.assertRaises(SquashFSFragmentTailError):
+            self.read_with_fragment(3, b"ab", 3)
+        with self.assertRaises(SquashFSFragmentTailError):
+            self.read_with_fragment(3, b"ab", 0)
+
+    def test_empty_and_exact_full_no_fragment_paths(self):
+        self.assertEqual(self.helper.read_synthetic((self.helper.regular_inode_bytes(0),), b""), b"")
+        payload = b"x" * 16
+        metadata = self.helper.regular_inode_bytes(16) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | 16)
+        self.assertEqual(self.helper.read_synthetic((metadata,), payload), payload)
+
+    def test_multiple_and_sparse_full_blocks_with_fragment_tail(self):
+        full = b"a" * 16
+        self.assertEqual(self.read_with_fragment(19, b"end", 0, full), full + b"end")
+
+    def test_fragment_slice_at_exact_block_boundary(self):
+        self.assertEqual(self.read_with_fragment(3, b"xxend", 2), b"end")
+
+    def test_fragment_table_errors_are_typed_and_chained(self):
+        error = SquashFSFragmentIndexError("outside")
+        with self.assertRaises(SquashFSFragmentTailError) as raised:
+            self.read_with_fragment(3, b"abc", error=error)
+        self.assertIs(raised.exception.__cause__, error)
+
+    def test_truncated_fragment_block_is_wrapped(self):
+        with self.assertRaises(SquashFSFragmentTailError):
+            self.read_with_fragment(3, b"")
+
+    def test_invalid_fragment_tail_and_final_size_contract(self):
+        metadata = self.helper.regular_inode_bytes(3)
+        self.assertEqual(self.helper.read_synthetic((metadata + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | 3),), b"abc"), b"abc")
+
+    def test_multiple_full_data_blocks_plus_fragment_tail(self):
+        first, second = b"a" * 16, b"b" * 16
+        metadata = self.helper.regular_inode_bytes(35, fragment=0) + b"".join((
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | 16),
+            REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(SQUASHFS_DATA_UNCOMPRESSED_BIT | 16),
+        ))
+        directory, image, stream = self.helper.make_image((metadata,), first + second)
+        with directory, patch("squashfs.SquashFSFragmentTable") as table_type:
+            table_type.return_value.read_block.return_value = b"end"
+            self.assertEqual(read_basic_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0))), first + second + b"end")
+
+    def test_compressed_and_sparse_full_blocks_plus_fragment_tail(self):
+        full = b"c" * 16
+        stored = zstandard.ZstdCompressor().compress(full)
+        for encoded, payload, expected in ((len(stored), stored, full + b"end"), (0, b"", b"\0" * 16 + b"end")):
+            metadata = self.helper.regular_inode_bytes(19, fragment=0) + REGULAR_FILE_BLOCK_SIZE_STRUCT.pack(encoded)
+            directory, image, stream = self.helper.make_image((metadata,), payload)
+            with directory, patch("squashfs.SquashFSFragmentTable") as table_type:
+                table_type.return_value.read_block.return_value = b"end"
+                self.assertEqual(read_basic_regular_file(image, stream, read_inode(stream, SquashFSMetadataReference(0, 0))), expected)
+
+    def test_final_assembled_size_mismatch_raises_typed_error(self):
+        with patch("squashfs.SquashFSFragmentTable") as table_type:
+            table_type.return_value.read_block.return_value = b"xx"
+            with self.assertRaises(SquashFSFragmentTailError):
+                self.read_with_fragment(3, b"", offset=0, error=None)
+
+    def test_rootfs_has_a_fragment_backed_basic_regular_file(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        inode_stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        directory_stream = SquashFSMetadataStream(image, superblock.directory_table_start)
+        pending = [inode_stream.read_basic_directory_inode(decode_metadata_reference(superblock.root_inode))]
+        seen = set()
+
+        while pending:
+            directory = pending.pop()
+            for record in read_directory(directory_stream, directory):
+                if record.inode_reference in seen or record.name in (b".", b".."):
+                    continue
+                seen.add(record.inode_reference)
+                if record.inode_type == BASIC_DIRECTORY_INODE_TYPE:
+                    pending.append(inode_stream.read_basic_directory_inode(record.inode_reference))
+                elif record.inode_type == BASIC_REGULAR_INODE_TYPE:
+                    inode = read_inode(inode_stream, record.inode_reference)
+                    if inode.body.fragment == SQUASHFS_INVALID_FRAGMENT:
+                        continue
+                    data = read_basic_regular_file(image, inode_stream, inode)
+                    self.assertEqual(len(data), inode.body.file_size)
+                    self.assertTrue(data)
+                    return
+
+        self.fail("UDM Pro ROOTFS has no fragment-backed basic regular inode")
 
 
 if __name__ == "__main__":

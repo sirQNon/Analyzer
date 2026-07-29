@@ -31,8 +31,7 @@ bytes and does not advance the physical data offset.
 `SQUASHFS_INVALID_FRAG` is `0xffffffff`.  With that value, the block list has
 `ceil(file_size / superblock.block_size)` entries.  With a valid fragment,
 the list covers only the complete data blocks, and the tail belongs to the
-fragment table.  Stage 10 raises `SquashFSFragmentFileUnsupportedError` before
-returning any bytes for this case.
+fragment table.  Stage 13 reads that tail through the fragment-table reader.
 
 ## Reader architecture
 
@@ -63,7 +62,6 @@ superblock block size.
 * `SquashFSDataBlockDecompressionError` — Zstandard rejects a compressed block.
 * `SquashFSDataBlockSizeError` — decoded or uncompressed size differs from the
   expected logical size.
-* `SquashFSFragmentFileUnsupportedError` — a fragment-backed regular file.
 
 ## UDM Pro integration facts
 

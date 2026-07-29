@@ -234,9 +234,8 @@ class SquashFSMalformedBlockListError(SquashFSRegularFileError):
     """A regular-file block-list entry is not a valid SquashFS size."""
 
 
-class SquashFSFragmentFileUnsupportedError(SquashFSRegularFileError):
-    """A basic regular file stores a tail in a fragment block."""
-
+class SquashFSFragmentTailError(SquashFSRegularFileError):
+    """A basic regular-file fragment tail is invalid or unavailable."""
 
 class SquashFSDataBlockTruncatedError(SquashFSRegularFileError):
     """A regular-file data block exceeds the physical image."""
@@ -1103,19 +1102,16 @@ def read_basic_regular_file(
         raise SquashFSRegularFileError("Typed inode is not a basic regular file")
 
     regular_inode = inode.body
-    if regular_inode.fragment != SQUASHFS_INVALID_FRAGMENT:
-        raise SquashFSFragmentFileUnsupportedError(
-            "Fragment-backed basic regular file is unsupported: "
-            f"inode {regular_inode.header.inode_number}, fragment {regular_inode.fragment}"
-        )
-
     superblock = image.superblock or image.read_superblock()
+    tail_size = regular_inode.file_size % superblock.block_size
+    if regular_inode.fragment != SQUASHFS_INVALID_FRAGMENT and tail_size == 0:
+        raise SquashFSFragmentTailError("Regular-file fragment has no tail")
     entry_count = basic_regular_file_block_count(
         regular_inode.file_size,
         superblock.block_size,
         regular_inode.fragment,
     )
-    if entry_count == 0:
+    if entry_count == 0 and regular_inode.fragment == SQUASHFS_INVALID_FRAGMENT:
         return b""
 
     list_reference = metadata_stream.advance_reference(
@@ -1138,7 +1134,8 @@ def read_basic_regular_file(
         blocks.append(block)
         remaining -= logical_size
 
-    if remaining != 0:
+    expected_remaining = tail_size if regular_inode.fragment != SQUASHFS_INVALID_FRAGMENT else 0
+    if remaining != expected_remaining:
         raise SquashFSRegularFileError(
             "Regular-file block list does not cover declared file size: "
             f"remaining {remaining}"
@@ -1149,6 +1146,16 @@ def read_basic_regular_file(
     for block in blocks:
         parts.append(image.read_regular_data_block(data_offset, block))
         data_offset += block.stored_size
+
+    if regular_inode.fragment != SQUASHFS_INVALID_FRAGMENT:
+        try:
+            fragment_block = SquashFSFragmentTable(image).read_block(regular_inode.fragment)
+        except SquashFSFragmentError as error:
+            raise SquashFSFragmentTailError("Cannot read regular-file fragment") from error
+        fragment_end = regular_inode.offset + tail_size
+        if regular_inode.offset > len(fragment_block) or fragment_end > len(fragment_block):
+            raise SquashFSFragmentTailError("Regular-file fragment tail exceeds fragment block")
+        parts.append(fragment_block[regular_inode.offset:fragment_end])
 
     result = b"".join(parts)
     if len(result) != regular_inode.file_size:
