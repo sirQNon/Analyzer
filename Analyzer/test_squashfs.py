@@ -21,6 +21,10 @@ from squashfs import (
     EXTENDED_REGULAR_INODE_BODY_STRUCT,
     EXTENDED_REGULAR_INODE_SIZE,
     EXTENDED_REGULAR_INODE_TYPE,
+    EXTENDED_DIRECTORY_INODE_BODY_STRUCT,
+    EXTENDED_DIRECTORY_INODE_SIZE,
+    EXTENDED_DIRECTORY_INODE_TYPE,
+    DIRECTORY_INDEX_STRUCT,
     DIRECTORY_ENTRY_SIZE,
     DIRECTORY_ENTRY_STRUCT,
     DIRECTORY_HEADER_SIZE,
@@ -44,6 +48,8 @@ from squashfs import (
     SquashFSBasicRegularInode,
     SquashFSBasicSymlinkInode,
     SquashFSExtendedRegularInode,
+    SquashFSExtendedDirectoryInode,
+    SquashFSDirectoryIndex,
     SquashFSDirectoryEntry,
     SquashFSDirectoryError,
     SquashFSDirectoryHeader,
@@ -74,6 +80,7 @@ from squashfs import (
     parse_basic_directory_inode,
     parse_basic_symlink_inode,
     parse_extended_regular_inode,
+    parse_directory_index,
     parse_fragment_entry,
     parse_directory_entry,
     parse_directory_header,
@@ -81,6 +88,7 @@ from squashfs import (
     parse_regular_file_block_size_entry,
     read_basic_regular_file,
     read_extended_regular_file,
+    read_directory_indexes,
     read_basic_symlink,
     read_directory,
     read_inode,
@@ -898,7 +906,7 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         self.assertEqual(inode.body, SquashFSBasicRegularInode(inode.header, 10, 11, 12, 13))
 
     def test_unsupported_known_and_unknown_types_are_distinct_data_errors(self):
-        for inode_type in (8, 99):
+        for inode_type in (10, 99):
             directory, stream = self.stream_for(INODE_HEADER_STRUCT.pack(inode_type, 0, 0, 0, 0, 1))
             with directory:
                 with self.assertRaisesRegex(SquashFSUnsupportedInodeTypeError, str(inode_type)):
@@ -956,6 +964,54 @@ class SquashFSTypedInodeDispatcherTest(unittest.TestCase):
         self.assertIsInstance(bash_inode.body, SquashFSBasicRegularInode)
         self.assertEqual(bash_inode.header.inode_number, bash_record.inode_number)
         self.assertEqual(bash_inode.header.inode_type, bash_record.inode_type)
+
+
+class SquashFSExtendedDirectoryInodeParserTest(unittest.TestCase):
+    def test_dispatches_all_extended_directory_fields_across_blocks(self):
+        body = EXTENDED_DIRECTORY_INODE_BODY_STRUCT.pack(2, 15, 7, 1, 2, 3, 4)
+        raw = INODE_HEADER_STRUCT.pack(EXTENDED_DIRECTORY_INODE_TYPE, 0o755, 0, 0, 0, 9) + body
+        helper = SquashFSBasicRegularFileReaderTest
+        directory = tempfile.TemporaryDirectory()
+        path = Path(directory.name) / "inode.bin"
+        path.write_bytes(struct.pack("<H", METADATA_UNCOMPRESSED_BIT | 20) + raw[:20] + struct.pack("<H", METADATA_UNCOMPRESSED_BIT | len(raw[20:])) + raw[20:])
+        with directory:
+            inode = read_inode(SquashFSMetadataStream(SquashFSImage(path), 0), SquashFSMetadataReference(0, 0))
+        self.assertIsInstance(inode.body, SquashFSExtendedDirectoryInode)
+        self.assertEqual((inode.body.nlink, inode.body.file_size, inode.body.start_block, inode.body.parent_inode, inode.body.i_count, inode.body.offset, inode.body.xattr), (2, 15, 7, 1, 2, 3, 4))
+
+
+class SquashFSDirectoryIndexParserTest(unittest.TestCase):
+    def test_parses_variable_length_index(self):
+        index = parse_directory_index(DIRECTORY_INDEX_STRUCT.pack(4, 7, 2) + b"abc")
+        self.assertEqual(index, SquashFSDirectoryIndex(4, 7, b"abc", 15))
+        with self.assertRaises(SquashFSDirectoryError):
+            parse_directory_index(b"\0" * 11)
+
+
+class SquashFSExtendedDirectoryReaderTest(unittest.TestCase):
+    def test_rootfs_extended_directory_indexes_and_entries(self):
+        image = SquashFSImage(ROOTFS)
+        superblock = image.read_superblock()
+        inode_stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        directory_stream = SquashFSMetadataStream(image, superblock.directory_table_start)
+        pending = [inode_stream.read_basic_directory_inode(decode_metadata_reference(superblock.root_inode))]
+        seen = set()
+        while pending:
+            for record in read_directory(directory_stream, pending.pop()):
+                if record.inode_reference in seen:
+                    continue
+                seen.add(record.inode_reference)
+                inode = read_inode(inode_stream, record.inode_reference)
+                if isinstance(inode.body, SquashFSBasicDirectoryInode):
+                    pending.append(inode.body)
+                if isinstance(inode.body, SquashFSExtendedDirectoryInode):
+                    indexes, _ = read_directory_indexes(inode_stream, inode)
+                    entries = read_directory(directory_stream, inode.body)
+                    self.assertEqual(len(indexes), inode.body.i_count)
+                    self.assertTrue(entries)
+                    self.assertIsInstance(read_inode(inode_stream, entries[0].inode_reference), SquashFSInode)
+                    return
+        self.fail("UDM Pro ROOTFS has no root-level extended directory inode")
 
 
 class SquashFSBasicRegularFileReaderTest(unittest.TestCase):

@@ -33,6 +33,12 @@ EXTENDED_REGULAR_INODE_TYPE = 9
 EXTENDED_REGULAR_INODE_BODY_STRUCT = struct.Struct("<QQQIIII")
 EXTENDED_REGULAR_INODE_BODY_SIZE = EXTENDED_REGULAR_INODE_BODY_STRUCT.size
 EXTENDED_REGULAR_INODE_SIZE = INODE_HEADER_SIZE + EXTENDED_REGULAR_INODE_BODY_SIZE
+EXTENDED_DIRECTORY_INODE_TYPE = 8
+EXTENDED_DIRECTORY_INODE_BODY_STRUCT = struct.Struct("<IIIIHHI")
+EXTENDED_DIRECTORY_INODE_BODY_SIZE = EXTENDED_DIRECTORY_INODE_BODY_STRUCT.size
+EXTENDED_DIRECTORY_INODE_SIZE = INODE_HEADER_SIZE + EXTENDED_DIRECTORY_INODE_BODY_SIZE
+DIRECTORY_INDEX_STRUCT = struct.Struct("<III")
+DIRECTORY_INDEX_SIZE = DIRECTORY_INDEX_STRUCT.size
 REGULAR_FILE_BLOCK_SIZE_STRUCT = struct.Struct("<I")
 REGULAR_FILE_BLOCK_SIZE_ENTRY_SIZE = REGULAR_FILE_BLOCK_SIZE_STRUCT.size
 SQUASHFS_INVALID_FRAGMENT = 0xFFFFFFFF
@@ -154,6 +160,28 @@ class SquashFSExtendedRegularInode:
 
 
 @dataclass(frozen=True)
+class SquashFSExtendedDirectoryInode:
+    """The on-disk SquashFS v4 extended directory inode."""
+    header: SquashFSInodeHeader
+    nlink: int
+    file_size: int
+    start_block: int
+    parent_inode: int
+    i_count: int
+    offset: int
+    xattr: int
+
+
+@dataclass(frozen=True)
+class SquashFSDirectoryIndex:
+    """One variable-length extended-directory index record."""
+    index: int
+    start_block: int
+    name: bytes
+    encoded_size: int
+
+
+@dataclass(frozen=True)
 class SquashFSFragmentEntry:
     """One on-disk SquashFS v4 fragment-table entry."""
 
@@ -187,6 +215,7 @@ SquashFSInodeBody = (
     | SquashFSBasicRegularInode
     | SquashFSBasicSymlinkInode
     | SquashFSExtendedRegularInode
+    | SquashFSExtendedDirectoryInode
 )
 
 
@@ -301,6 +330,10 @@ class SquashFSDirectoryError(ValueError):
 
 class SquashFSDirectoryReaderError(ValueError):
     """A directory inode cannot be read as a complete directory stream."""
+
+
+class SquashFSDirectoryIndexError(SquashFSDirectoryError):
+    """An extended-directory index record is malformed or incomplete."""
 
 
 def decode_metadata_reference(reference: int) -> SquashFSMetadataReference:
@@ -497,6 +530,40 @@ def parse_extended_regular_inode_body(
     return SquashFSExtendedRegularInode(header, *body)
 
 
+def parse_extended_directory_inode_body(header: SquashFSInodeHeader, data: bytes) -> SquashFSExtendedDirectoryInode:
+    if not isinstance(header, SquashFSInodeHeader):
+        raise TypeError("Extended directory inode header has an invalid type")
+    if not isinstance(data, bytes):
+        raise TypeError("Extended directory inode body data must be bytes")
+    if len(data) < EXTENDED_DIRECTORY_INODE_BODY_SIZE:
+        raise SquashFSInodeError("Extended directory inode body is truncated")
+    if header.inode_type != EXTENDED_DIRECTORY_INODE_TYPE:
+        raise SquashFSInodeError("Extended directory inode type mismatch")
+    try:
+        return SquashFSExtendedDirectoryInode(header, *EXTENDED_DIRECTORY_INODE_BODY_STRUCT.unpack_from(data))
+    except struct.error as error:
+        raise SquashFSInodeError("Cannot unpack extended directory inode body") from error
+
+
+def parse_directory_index(data: bytes) -> SquashFSDirectoryIndex:
+    """Decode exactly one extended-directory index record without I/O."""
+    if not isinstance(data, bytes):
+        raise TypeError("Directory index data must be bytes")
+    if len(data) < DIRECTORY_INDEX_SIZE:
+        raise SquashFSDirectoryIndexError("Directory index header is truncated")
+    try:
+        index, start_block, size = DIRECTORY_INDEX_STRUCT.unpack_from(data)
+    except struct.error as error:
+        raise SquashFSDirectoryIndexError("Cannot unpack directory index header") from error
+    name_size = size + 1
+    if name_size > DIRECTORY_NAME_MAX:
+        raise SquashFSDirectoryIndexError("Directory index name exceeds maximum length")
+    encoded_size = DIRECTORY_INDEX_SIZE + name_size
+    if len(data) < encoded_size:
+        raise SquashFSDirectoryIndexError("Directory index name is truncated")
+    return SquashFSDirectoryIndex(index, start_block, data[DIRECTORY_INDEX_SIZE:encoded_size], encoded_size)
+
+
 def basic_regular_file_block_count(
     file_size: int,
     block_size: int,
@@ -587,6 +654,7 @@ def parse_fragment_entry(data: bytes) -> SquashFSFragmentEntry:
 
 
 INODE_BODY_PARSERS = {
+    EXTENDED_DIRECTORY_INODE_TYPE: (EXTENDED_DIRECTORY_INODE_BODY_SIZE, parse_extended_directory_inode_body),
     BASIC_DIRECTORY_INODE_TYPE: (
         BASIC_DIRECTORY_INODE_BODY_SIZE,
         parse_basic_directory_inode_body,
@@ -723,31 +791,54 @@ def directory_entry_reference(
     )
 
 
+def read_directory_indexes(
+    metadata_stream: SquashFSMetadataStream,
+    inode: SquashFSInode,
+) -> tuple[list[SquashFSDirectoryIndex], SquashFSMetadataReference]:
+    """Read the index area following one extended directory inode."""
+    if not isinstance(metadata_stream, SquashFSMetadataStream) or not isinstance(inode, SquashFSInode):
+        raise TypeError("Directory index arguments have invalid types")
+    if not isinstance(inode.body, SquashFSExtendedDirectoryInode):
+        raise SquashFSDirectoryIndexError("Typed inode is not an extended directory")
+    reference = metadata_stream.advance_reference(inode.reference, EXTENDED_DIRECTORY_INODE_SIZE)
+    indexes = []
+    for _ in range(inode.body.i_count):
+        try:
+            header = metadata_stream.read(reference, DIRECTORY_INDEX_SIZE)
+            _, _, size = DIRECTORY_INDEX_STRUCT.unpack(header)
+            record = parse_directory_index(metadata_stream.read(reference, DIRECTORY_INDEX_SIZE + size + 1))
+        except (SquashFSMetadataStreamError, struct.error) as error:
+            raise SquashFSDirectoryIndexError("Cannot read directory index") from error
+        indexes.append(record)
+        reference = metadata_stream.advance_reference(reference, record.encoded_size)
+    return indexes, reference
+
+
 def read_directory(
     metadata_stream: SquashFSMetadataStream,
-    basic_directory_inode: SquashFSBasicDirectoryInode,
+    directory_inode: SquashFSBasicDirectoryInode | SquashFSExtendedDirectoryInode,
 ) -> list[SquashFSDirectoryRecord]:
-    """Read exactly one basic-directory inode's on-disk directory records."""
+    """Read one basic or extended directory's sequential table records."""
     if not isinstance(metadata_stream, SquashFSMetadataStream):
         raise TypeError("Directory metadata stream has an invalid type")
 
-    if not isinstance(basic_directory_inode, SquashFSBasicDirectoryInode):
-        raise TypeError("Basic directory inode has an invalid type")
+    if not isinstance(directory_inode, (SquashFSBasicDirectoryInode, SquashFSExtendedDirectoryInode)):
+        raise TypeError("Directory inode has an invalid type")
 
-    if basic_directory_inode.file_size < DIRECTORY_POSITION_OFFSET:
+    if directory_inode.file_size < DIRECTORY_POSITION_OFFSET:
         raise SquashFSDirectoryReaderError(
             "Directory inode file size is smaller than the directory position offset: "
-            f"size {basic_directory_inode.file_size}, "
+            f"size {directory_inode.file_size}, "
             f"offset {DIRECTORY_POSITION_OFFSET}"
         )
 
-    stream_size = basic_directory_inode.file_size - DIRECTORY_POSITION_OFFSET
+    stream_size = directory_inode.file_size - DIRECTORY_POSITION_OFFSET
     if stream_size == 0:
         return []
 
     reference = SquashFSMetadataReference(
-        block_offset=basic_directory_inode.start_block,
-        byte_offset=basic_directory_inode.offset,
+        block_offset=directory_inode.start_block,
+        byte_offset=directory_inode.offset,
     )
     data = metadata_stream.read(reference, stream_size)
     cursor = 0
