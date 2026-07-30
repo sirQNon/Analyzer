@@ -153,6 +153,32 @@ class SquashFSXAttrIDTable:
 
 
 @dataclass(frozen=True)
+class SquashFSXAttrNamespace:
+    raw_type: int
+    prefix: bytes | None
+    known: bool
+
+
+@dataclass(frozen=True)
+class SquashFSXAttrEntry:
+    raw_type: int
+    namespace: SquashFSXAttrNamespace
+    name: bytes
+    full_name: bytes | None
+    value: bytes | None
+    value_size: int
+    out_of_line: bool
+    out_of_line_reference: int | None
+
+
+@dataclass(frozen=True)
+class SquashFSXAttrList:
+    xattr_id: SquashFSXAttrID
+    entries: tuple[SquashFSXAttrEntry, ...]
+    consumed_size: int
+
+
+@dataclass(frozen=True)
 class SquashFSInodeHeader:
     """The common on-disk prefix of every SquashFS inode."""
 
@@ -364,6 +390,22 @@ class SquashFSXAttrIDError(SquashFSXAttrError):
     """An xattr ID is outside range or cannot be read."""
 
 
+class SquashFSXAttrListError(SquashFSXAttrError):
+    """An xattr entry list does not match its ID record."""
+
+
+class SquashFSXAttrEntryError(SquashFSXAttrListError):
+    """An xattr entry header or name cannot be read."""
+
+
+class SquashFSXAttrValueError(SquashFSXAttrListError):
+    """An xattr inline value or OOL reference cannot be read."""
+
+
+class SquashFSXAttrInodeError(SquashFSXAttrError):
+    """An inode's xattr ID cannot be resolved to an xattr list."""
+
+
 class SquashFSUnsupportedInodeTypeError(SquashFSInodeError):
     """A valid SquashFS inode type has no Stage 9 typed parser."""
 
@@ -572,6 +614,117 @@ def read_xattr_id(image: SquashFSImage, index: int, table: SquashFSXAttrIDTable 
     except (SquashFSMetadataError, SquashFSMetadataStreamError, struct.error, IndexError) as error:
         raise SquashFSXAttrIDError("Cannot read xattr ID") from error
     return SquashFSXAttrID(index, encoded, count, size, decode_xattr_reference(encoded))
+
+
+XATTR_ENTRY_STRUCT = struct.Struct("<HH")
+XATTR_VALUE_STRUCT = struct.Struct("<I")
+XATTR_VALUE_OOL = 0x100
+XATTR_PREFIX_MASK = 0xff
+XATTR_PREFIXES = {0: b"user.", 1: b"trusted.", 2: b"security."}
+
+
+def decode_xattr_namespace(raw_type: int) -> SquashFSXAttrNamespace:
+    if not isinstance(raw_type, int) or isinstance(raw_type, bool) or not 0 <= raw_type <= 0xffff:
+        raise TypeError("Xattr type must be an unsigned 16-bit integer")
+    namespace = raw_type & XATTR_PREFIX_MASK
+    prefix = XATTR_PREFIXES.get(namespace)
+    return SquashFSXAttrNamespace(namespace, prefix, prefix is not None and not (raw_type & ~(XATTR_PREFIX_MASK | XATTR_VALUE_OOL)))
+
+
+def read_xattr_list(image: SquashFSImage, xattr_id: SquashFSXAttrID, table: SquashFSXAttrIDTable | None = None) -> SquashFSXAttrList:
+    if not isinstance(image, SquashFSImage) or not isinstance(xattr_id, SquashFSXAttrID):
+        raise TypeError("Xattr list arguments have invalid types")
+    table = read_xattr_id_table(image) if table is None else table
+    if table is None:
+        raise SquashFSXAttrTableError("Xattr ID table is unavailable")
+    if not 0 <= xattr_id.index < table.xattr_ids:
+        raise SquashFSXAttrIDError("Xattr ID index is outside table range")
+    stream = SquashFSMetadataStream(
+        image, table.xattr_table_start + xattr_id.reference.block
+    )
+    reference = SquashFSMetadataReference(0, xattr_id.reference.offset)
+    consumed = 0
+    entries: list[SquashFSXAttrEntry] = []
+
+    def read_field(size: int) -> bytes:
+        nonlocal consumed, reference
+        data = stream.read(reference, size)
+        reference = stream.advance_reference(reference, size)
+        consumed += size
+        return data
+
+    for entry_index in range(xattr_id.count):
+        try:
+            raw_type, name_size = XATTR_ENTRY_STRUCT.unpack(
+                read_field(XATTR_ENTRY_STRUCT.size)
+            )
+            name = read_field(name_size)
+        except (SquashFSMetadataError, SquashFSMetadataStreamError, struct.error) as error:
+            raise SquashFSXAttrEntryError(
+                f"Cannot read xattr entry {entry_index}"
+            ) from error
+
+        try:
+            value_size = XATTR_VALUE_STRUCT.unpack(
+                read_field(XATTR_VALUE_STRUCT.size)
+            )[0]
+            namespace = decode_xattr_namespace(raw_type)
+            out_of_line = bool(raw_type & XATTR_VALUE_OOL)
+            if out_of_line:
+                if value_size != 8:
+                    raise SquashFSXAttrValueError(
+                        "Out-of-line xattr value representation must be 8 bytes"
+                    )
+                out_of_line_reference = struct.unpack("<Q", read_field(8))[0]
+                value = None
+            else:
+                value = read_field(value_size)
+                out_of_line_reference = None
+            entries.append(
+                SquashFSXAttrEntry(
+                    raw_type,
+                    namespace,
+                    name,
+                    None if namespace.prefix is None else namespace.prefix + name,
+                    value,
+                    value_size,
+                    out_of_line,
+                    out_of_line_reference,
+                )
+            )
+        except SquashFSXAttrValueError:
+            raise
+        except (SquashFSMetadataError, SquashFSMetadataStreamError, struct.error) as error:
+            raise SquashFSXAttrValueError(
+                f"Cannot read xattr value for entry {entry_index}"
+            ) from error
+    padding_size = xattr_id.size - consumed
+    if padding_size < 0 or padding_size > 3 or (padding_size and xattr_id.size % 4):
+        raise SquashFSXAttrListError("Xattr list size does not match ID record")
+    if padding_size:
+        try:
+            padding = stream.read(reference, padding_size)
+        except (SquashFSMetadataError, SquashFSMetadataStreamError) as error:
+            raise SquashFSXAttrListError(
+                "Cannot read xattr list alignment padding"
+            ) from error
+        if padding != b"\0" * padding_size:
+            raise SquashFSXAttrListError("Xattr list size does not match ID record")
+    return SquashFSXAttrList(xattr_id, tuple(entries), consumed)
+
+
+def read_inode_xattrs(image: SquashFSImage, inode: SquashFSInode, table: SquashFSXAttrIDTable | None = None) -> SquashFSXAttrList | None:
+    if not isinstance(inode, SquashFSInode):
+        raise TypeError("Xattr inode has an invalid type")
+    xattr_id = getattr(inode.body, "xattr_id", None)
+    if xattr_id is None:
+        return None
+    try:
+        return read_xattr_list(image, read_xattr_id(image, xattr_id, table), table)
+    except SquashFSXAttrError as error:
+        raise SquashFSXAttrInodeError(
+            f"Cannot read xattrs for inode ID {xattr_id}"
+        ) from error
 
 
 def parse_inode_header(data: bytes) -> SquashFSInodeHeader:

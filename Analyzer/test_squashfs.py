@@ -59,6 +59,13 @@ from squashfs import (
     SquashFSInodeLookupEntryError,
     SquashFSXAttrTableError,
     SquashFSXAttrIDError,
+    SquashFSXAttrListError,
+    SquashFSXAttrEntryError,
+    SquashFSXAttrValueError,
+    SquashFSXAttrInodeError,
+    decode_xattr_namespace,
+    read_xattr_list,
+    read_inode_xattrs,
     read_xattr_id_table,
     read_xattr_id,
     decode_xattr_reference,
@@ -1854,6 +1861,33 @@ class _XAttrFixture(unittest.TestCase):
     def patch(self, image, offset, data):
         with image.image.open('r+b') as source: source.seek(offset); source.write(data)
         image.superblock=None
+    def list_image(self, entries, *, compressed=False, ids=None, list_offset=0):
+        d=tempfile.TemporaryDirectory(); p=Path(d.name)/'list.sqfs'; xstart=128; idmeta=4096; table=5000
+        payload=b'\0'*list_offset+b''.join(struct.pack('<HH',typ,len(name))+name+struct.pack('<I',len(value))+value for typ,name,value in entries)
+        stored=zstandard.ZstdCompressor().compress(payload) if compressed else payload; header=len(stored) if compressed else METADATA_UNCOMPRESSED_BIT|len(stored)
+        records=ids or ((list_offset,len(entries),len(payload)-list_offset),); iddata=b''.join(XATTR_ID_STRUCT.pack(*record) for record in records); ih=METADATA_UNCOMPRESSED_BIT|len(iddata); end=table+16+8
+        b=bytearray(end); sb=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,end,0,table,0,0,0,0); b[:len(sb)]=sb
+        b[xstart:xstart+2]=struct.pack('<H',header); b[xstart+2:xstart+2+len(stored)]=stored; b[idmeta:idmeta+2]=struct.pack('<H',ih); b[idmeta+2:idmeta+2+len(iddata)]=iddata; b[table:table+16]=struct.pack('<QII',xstart,len(records),0); b[table+16:table+24]=struct.pack('<Q',idmeta); p.write_bytes(b); return d,SquashFSImage(p)
+    def boundary_list_image(self, raw, count, size, offset, *, compressed_first=False):
+        d=tempfile.TemporaryDirectory(); p=Path(d.name)/'boundary.sqfs'; xstart=128; first=b'\0'*offset+raw; first=first[:METADATA_SIZE]; second=(b'\0'*offset+raw)[METADATA_SIZE:]; stored_first=zstandard.ZstdCompressor().compress(first) if compressed_first else first; first_header=len(stored_first) if compressed_first else METADATA_UNCOMPRESSED_BIT|len(stored_first); secondpos=xstart+2+len(stored_first); idmeta=secondpos+2+len(second)+8; table=idmeta+18; end=table+24
+        b=bytearray(end); sb=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,end,0,table,0,0,0,0); b[:len(sb)]=sb
+        b[xstart:xstart+2]=struct.pack('<H',first_header); b[xstart+2:xstart+2+len(stored_first)]=stored_first; b[secondpos:secondpos+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(second)); b[secondpos+2:secondpos+2+len(second)]=second
+        b[idmeta:idmeta+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|16); b[idmeta+2:idmeta+18]=XATTR_ID_STRUCT.pack(offset,count,size); b[table:table+16]=struct.pack('<QII',xstart,1,0); b[table+16:table+24]=struct.pack('<Q',idmeta); p.write_bytes(b); return d,SquashFSImage(p),secondpos
+    def multi_list_image(self, lists):
+        d=tempfile.TemporaryDirectory(); p=Path(d.name)/'lists.sqfs'; xstart=128; payload=b''; records=[]
+        for entries in lists:
+            raw=b''.join(struct.pack('<HH',typ,len(name))+name+struct.pack('<I',len(value))+value for typ,name,value in entries)
+            records.append((len(payload),len(entries),len(raw))); payload+=raw
+        idmeta=xstart+2+len(payload)+8; table=idmeta+2+len(records)*16+8; end=table+16+8
+        b=bytearray(end); sb=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,end,0,table,0,0,0,0); b[:len(sb)]=sb
+        b[xstart:xstart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(payload)); b[xstart+2:xstart+2+len(payload)]=payload; iddata=b''.join(XATTR_ID_STRUCT.pack(*record) for record in records); b[idmeta:idmeta+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(iddata)); b[idmeta+2:idmeta+2+len(iddata)]=iddata; b[table:table+16]=struct.pack('<QII',xstart,len(records),0); b[table+16:table+24]=struct.pack('<Q',idmeta); p.write_bytes(b); return d,SquashFSImage(p)
+    def extended_inode(self, xattr):
+        header=SquashFSInodeHeader(9,0,0,0,0,1); body=SquashFSExtendedRegularInode(header,0,0,0,1,SQUASHFS_INVALID_FRAGMENT,0,xattr)
+        return SquashFSInode(SquashFSMetadataReference(0,0),header,body)
+    def parsed_extended_inode(self, image, xattr):
+        offset=image.image.stat().st_size; raw=INODE_HEADER_STRUCT.pack(9,0,0,0,0,1)+EXTENDED_REGULAR_INODE_BODY_STRUCT.pack(0,0,0,1,SQUASHFS_INVALID_FRAGMENT,0,xattr)
+        with image.image.open('ab') as source: source.write(struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(raw))+raw)
+        return read_inode(SquashFSMetadataStream(image,offset),SquashFSMetadataReference(0,0))
 
 class SquashFSXAttrIDTableReaderTest(_XAttrFixture):
     def test_rootfs_optional_table_discovery(self):
@@ -2052,15 +2086,600 @@ class SquashFSXAttrRootfsTest(unittest.TestCase):
         self.assertEqual((item.encoded_reference,item.reference.block,item.reference.offset,item.count,item.size),(0,0,0,1,40))
         self.assertEqual(table.table_start+16+8*len(table.metadata_block_offsets),sb.bytes_used)
     def test_rootfs_extended_inode_xattr_ids_are_in_range(self):
-        image=SquashFSImage(ROOTFS); sb=image.read_superblock(); table=read_xattr_id_table(image); lookup=read_inode_lookup_table(image); stream=SquashFSMetadataStream(image,sb.inode_table_start)
+        image=SquashFSImage(ROOTFS); sb=image.read_superblock(); table=read_xattr_id_table(image)
         values=[]; extended=0
-        for number in range(1,lookup.inode_count+1):
-            body=resolve_inode_number(image,stream,lookup,number).body
+        for inode in SquashFSXAttrEntryListRootFSIntegrationTest.rootfs_inodes(image,sb):
+            body=inode.body
             if isinstance(body,(SquashFSExtendedDirectoryInode,SquashFSExtendedRegularInode,SquashFSExtendedSymlinkInode)):
                 extended+=1
                 if body.xattr_id is not None: values.append(body.xattr_id)
         self.assertEqual((extended,len(values),min(values),max(values)),(23,1,0,0))
         self.assertTrue(all(0<=value<table.xattr_ids for value in values))
+
+
+@unittest.skipUnless(ROOTFS.is_file(), "UDM Pro ROOTFS fixture is unavailable")
+class SquashFSXAttrEntryListRootFSIntegrationTest(unittest.TestCase):
+    _inode_cache=None
+    @staticmethod
+    def rootfs_context():
+        image=SquashFSImage(ROOTFS); superblock=image.read_superblock(); table=read_xattr_id_table(image)
+        return image,superblock,table
+    @classmethod
+    def rootfs_inodes(cls, image, superblock):
+        if cls._inode_cache is not None:
+            return cls._inode_cache
+        lookup=read_inode_lookup_table(image); stream=SquashFSMetadataStream(image,superblock.inode_table_start)
+        cls._inode_cache=tuple(resolve_inode_number(image,stream,lookup,number) for number in range(1,lookup.inode_count+1))
+        return cls._inode_cache
+    def test_real_rootfs_xattr_table_loads(self):
+        image,_,table=self.rootfs_context()
+        self.assertIsNotNone(table); self.assertEqual(table.xattr_ids,1)
+    def test_real_rootfs_id_zero_parses(self):
+        image,_,table=self.rootfs_context()
+        value=read_xattr_list(image,read_xattr_id(image,0,table),table)
+        self.assertEqual((value.xattr_id.index,len(value.entries)),(0,1))
+    def test_all_real_xattr_id_records_parse(self):
+        image,_,table=self.rootfs_context()
+        self.assertEqual([read_xattr_list(image,read_xattr_id(image,index,table),table).xattr_id.index for index in range(table.xattr_ids)],[0])
+    def test_real_list_count_and_consumed_size_match_measurement(self):
+        image,_,table=self.rootfs_context(); value=read_xattr_list(image,read_xattr_id(image,0,table),table)
+        self.assertEqual((len(value.entries),value.consumed_size,value.xattr_id.size),(1,38,40))
+    def test_real_namespace_and_representation_are_valid(self):
+        image,_,table=self.rootfs_context(); entry=read_xattr_list(image,read_xattr_id(image,0,table),table).entries[0]
+        self.assertEqual((entry.full_name,entry.out_of_line,entry.value_size),(b'security.capability',False,20))
+        self.assertEqual((entry.value,entry.out_of_line_reference),(b'\x01\x00\x00\x02\x00 \x00\x00'+b'\0'*12,None))
+    def test_real_inode_with_xattrs_resolves_through_inode_api(self):
+        image,superblock,table=self.rootfs_context(); inodes=self.rootfs_inodes(image,superblock); inode=next(inode for inode in inodes if getattr(inode.body,'xattr_id',None) is not None)
+        self.assertEqual(read_inode_xattrs(image,inode,table).entries[0].full_name,b'security.capability')
+    def test_real_inode_without_xattrs_returns_none(self):
+        image,superblock,table=self.rootfs_context(); inodes=self.rootfs_inodes(image,superblock); inode=next(inode for inode in inodes if getattr(inode.body,'xattr_id',None) is None)
+        self.assertIsNone(read_inode_xattrs(image,inode,table))
+    def test_real_extended_sentinel_is_not_id_zero(self):
+        image,superblock,table=self.rootfs_context(); inodes=self.rootfs_inodes(image,superblock); inode=next(inode for inode in inodes if isinstance(inode.body,(SquashFSExtendedDirectoryInode,SquashFSExtendedRegularInode,SquashFSExtendedSymlinkInode)) and inode.body.xattr_id is None)
+        self.assertIsNone(read_inode_xattrs(image,inode,table))
+
+class SquashFSXAttrNamespaceTest(unittest.TestCase):
+    def test_user_namespace(self): self.assertEqual(decode_xattr_namespace(0).prefix,b'user.')
+    def test_trusted_namespace(self): self.assertEqual(decode_xattr_namespace(1).prefix,b'trusted.')
+    def test_security_namespace(self): self.assertEqual(decode_xattr_namespace(2).prefix,b'security.')
+    def test_ool_bit_is_separate_from_namespace(self): self.assertEqual((decode_xattr_namespace(0x101).raw_type,decode_xattr_namespace(0x101).prefix),(1,b'trusted.'))
+    def test_unknown_type_is_preserved_exactly(self): self.assertEqual(decode_xattr_namespace(0x47).raw_type,0x47)
+    def test_raw_type_is_preserved(self): self.assertEqual(decode_xattr_namespace(0x101).raw_type,1)
+    def test_unknown_namespace_has_no_prefix(self): self.assertIsNone(decode_xattr_namespace(7).prefix)
+    def test_unknown_namespace_is_known_false(self): self.assertFalse(decode_xattr_namespace(7).known)
+    def test_namespace_model_is_immutable(self):
+        value=decode_xattr_namespace(0)
+        with self.assertRaises(AttributeError): value.prefix=b'x'
+
+class SquashFSXAttrEntryReaderTest(_XAttrFixture):
+    def test_regular_entry_preserves_binary_name_and_full_name(self):
+        d,i=self.list_image(((0,b'a\xff',b'v'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].full_name,b'user.a\xff')
+    def test_zero_length_name_is_structural(self):
+        d,i=self.list_image(((0,b'',b''),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].name,b'')
+    def test_truncated_entry_has_chained_error(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|2))
+            with self.assertRaises(SquashFSXAttrEntryError) as caught: read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+    def test_minimal_valid_entry(self):
+        d,i=self.list_image(((0,b'',b''),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'')
+    def test_name_with_nul_is_preserved(self):
+        d,i=self.list_image(((0,b'a\0b',b'v'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].name,b'a\0b')
+    def test_little_endian_name_size(self):
+        d,i=self.list_image(((0,b'ab',b'v'),))
+        with d:self.assertEqual(len(read_xattr_list(i,read_xattr_id(i,0)).entries[0].name),2)
+    def test_one_byte_entry_header_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|1))
+            with self.assertRaises(SquashFSXAttrEntryError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_three_byte_entry_header_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|3))
+            with self.assertRaises(SquashFSXAttrEntryError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_unknown_namespace_has_no_full_name(self):
+        d,i=self.list_image(((7,b'a',b'v'),))
+        with d:self.assertIsNone(read_xattr_list(i,read_xattr_id(i,0)).entries[0].full_name)
+    def test_entry_model_is_immutable(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            entry=read_xattr_list(i,read_xattr_id(i,0)).entries[0]
+            with self.assertRaises(AttributeError):entry.name=b'x'
+    def test_truncated_name_by_one_byte_is_rejected(self):
+        d,i=self.list_image(((0,b'ab',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|5))
+            with self.assertRaisesRegex(SquashFSXAttrEntryError,'Cannot read xattr entry 0'): read_xattr_list(i,read_xattr_id(i,0))
+    def test_name_size_larger_than_available_metadata_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128+2,struct.pack('<HH',0,0xffff))
+            with self.assertRaisesRegex(SquashFSXAttrEntryError,'Cannot read xattr entry 0'): read_xattr_list(i,read_xattr_id(i,0))
+    def test_zero_available_name_bytes_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|4)); self.patch(i,130,struct.pack('<HH',0,1))
+            with self.assertRaisesRegex(SquashFSXAttrEntryError,'Cannot read xattr entry 0'): read_xattr_list(i,read_xattr_id(i,0))
+    def test_name_crosses_physical_metadata_boundary(self):
+        raw=struct.pack('<HH',0,3)+b'abc'+struct.pack('<I',0); d,i,next_block=self.boundary_list_image(raw,1,len(raw),8186)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[8186:],struct.pack('<HH',0,3)+b'ab')
+            self.assertEqual(i.read_metadata_block(next_block).data[:1],b'c')
+            entry=read_xattr_list(i,read_xattr_id(i,0)).entries[0]
+            self.assertEqual((entry.name,next_block),(b'abc',128+2+METADATA_SIZE))
+    def test_name_starts_at_final_payload_byte(self):
+        raw=struct.pack('<HH',0,2)+b'ab'+struct.pack('<I',0); d,i,_=self.boundary_list_image(raw,1,len(raw),8187)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-1:],b'a')
+            self.assertEqual(i.read_metadata_block(128+2+METADATA_SIZE).data[:1],b'b')
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].name,b'ab')
+    def test_name_ends_exactly_at_payload_boundary(self):
+        raw=struct.pack('<HH',0,1)+b'a'+struct.pack('<I',0); d,i,_=self.boundary_list_image(raw,1,len(raw),8187)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-1:],b'a')
+            self.assertEqual(i.read_metadata_block(128+2+METADATA_SIZE).data[:4],struct.pack('<I',0))
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].name,b'a')
+    def test_entry_header_crosses_metadata_boundary(self):
+        raw=struct.pack('<HH',0,1)+b'a'+struct.pack('<I',0); d,i,_=self.boundary_list_image(raw,1,len(raw),8190)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-2:],b'\0\0')
+            self.assertEqual(i.read_metadata_block(128+2+METADATA_SIZE).data[:2],b'\1\0')
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].name,b'a')
+    def test_malformed_next_metadata_block_is_wrapped(self):
+        raw=struct.pack('<HH',0,3)+b'abc'+struct.pack('<I',0); d,i,next_block=self.boundary_list_image(raw,1,len(raw),8186)
+        with d:
+            self.patch(i,next_block,b'\0\0')
+            with self.assertRaises(SquashFSXAttrEntryError) as caught: read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+    def test_binary_name_is_exact_after_boundary_traversal(self):
+        raw=struct.pack('<HH',0,3)+b'\xff\0\x80'+struct.pack('<I',0); d,i,_=self.boundary_list_image(raw,1,len(raw),8186)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-2:],b'\xff\0')
+            self.assertEqual(i.read_metadata_block(128+2+METADATA_SIZE).data[:1],b'\x80')
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].name,b'\xff\0\x80')
+
+class SquashFSXAttrInlineValueTest(_XAttrFixture):
+    def test_zero_length_inline_value(self):
+        d,i=self.list_image(((0,b'n',b''),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'')
+    def test_normal_inline_value(self):
+        d,i=self.list_image(((0,b'n',b'value'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'value')
+    def test_binary_inline_value_contains_nul_bytes(self):
+        d,i=self.list_image(((0,b'n',b'a\0b'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'a\0b')
+    def test_binary_inline_value_contains_invalid_utf8_bytes(self):
+        d,i=self.list_image(((0,b'n',b'\xff\x80'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'\xff\x80')
+    def test_little_endian_vsize_is_decoded(self):
+        d,i=self.list_image(((0,b'n',b'\0'*0x102),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value_size,0x102)
+    def test_raw_value_bytes_are_preserved_exactly(self):
+        raw=b'\x00\xff\x80value'; d,i=self.list_image(((0,b'n',raw),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,raw)
+    def test_truncated_value_header_with_zero_bytes_is_rejected(self):
+        d,i=self.list_image(((0,b'n',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|5))
+            with self.assertRaisesRegex(SquashFSXAttrValueError,'value for entry 0'):read_xattr_list(i,read_xattr_id(i,0))
+    def test_one_byte_value_header_is_rejected(self):
+        d,i=self.list_image(((0,b'n',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|6))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_two_byte_value_header_is_rejected(self):
+        d,i=self.list_image(((0,b'n',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|7))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_three_byte_value_header_is_rejected(self):
+        d,i=self.list_image(((0,b'n',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|8))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_declared_inline_value_truncated_by_one_byte_is_rejected(self):
+        d,i=self.list_image(((0,b'n',b'ab'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|10))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_declared_inline_value_larger_than_available_metadata_is_rejected(self):
+        d,i=self.list_image(((0,b'n',b'v'),))
+        with d:
+            self.patch(i,135,struct.pack('<I',0xffff))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_zero_available_value_bytes_after_header_is_rejected(self):
+        d,i=self.list_image(((0,b'n',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|9))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_inline_value_crosses_physical_metadata_boundary(self):
+        value=b'abc'; raw=struct.pack('<HH',0,1)+b'n'+struct.pack('<I',3)+value; d,i,next_block=self.boundary_list_image(raw,1,len(raw),8181)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-2:],b'ab')
+            self.assertEqual(i.read_metadata_block(next_block).data[:1],b'c')
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,value)
+    def test_inline_value_starts_at_final_payload_byte(self):
+        value=b'ab'; raw=struct.pack('<HH',0,1)+b'n'+struct.pack('<I',2)+value; d,i,next_block=self.boundary_list_image(raw,1,len(raw),8182)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-1:],b'a')
+            self.assertEqual(i.read_metadata_block(next_block).data[:1],b'b')
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,value)
+    def test_inline_value_ends_exactly_at_payload_boundary(self):
+        value=b'a'; raw=struct.pack('<HH',0,1)+b'n'+struct.pack('<I',1)+value; d,i,next_block=self.boundary_list_image(raw,1,len(raw),8182)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-1:],value)
+            self.assertEqual(next_block,128+2+METADATA_SIZE)
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,value)
+    def test_value_header_crosses_metadata_block_boundary(self):
+        raw=struct.pack('<HH',0,1)+b'n'+struct.pack('<I',1)+b'a'; d,i,next_block=self.boundary_list_image(raw,1,len(raw),8185)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-2:],b'\1\0')
+            self.assertEqual(i.read_metadata_block(next_block).data[:2],b'\0\0')
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'a')
+    def test_malformed_next_metadata_block_while_reading_value_is_wrapped(self):
+        value=b'abc'; raw=struct.pack('<HH',0,1)+b'n'+struct.pack('<I',3)+value; d,i,next_block=self.boundary_list_image(raw,1,len(raw),8181)
+        with d:
+            self.patch(i,next_block,b'\0\0')
+            with self.assertRaises(SquashFSXAttrValueError) as caught:read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+    def test_uncompressed_inline_metadata_path(self):
+        d,i=self.list_image(((0,b'n',b'value'),),compressed=False)
+        with d:self.assertFalse(i.read_metadata_block(128).is_compressed);self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'value')
+    def test_compressed_inline_metadata_path(self):
+        d,i=self.list_image(((0,b'n',b'value'),),compressed=True)
+        with d:self.assertTrue(i.read_metadata_block(128).is_compressed);self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'value')
+    def test_compressed_block_transitions_to_following_metadata_block(self):
+        value=b'abc'; raw=struct.pack('<HH',0,1)+b'n'+struct.pack('<I',3)+value; d,i,next_block=self.boundary_list_image(raw,1,len(raw),8181,compressed_first=True)
+        with d:
+            self.assertTrue(i.read_metadata_block(128).is_compressed)
+            self.assertEqual(i.read_metadata_block(next_block).data[:1],b'c')
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,value)
+    def test_malformed_value_raises_typed_value_error(self):
+        d,i=self.list_image(((0,b'n',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|8))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_metadata_failure_is_preserved_as_value_error_cause(self):
+        d,i=self.list_image(((0,b'n',b'v'),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|9))
+            with self.assertRaises(SquashFSXAttrValueError) as caught:read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+    def test_inline_representation_is_unambiguous(self):
+        value=b'\0\xff'; d,i=self.list_image(((0,b'n',value),))
+        with d:
+            entry=read_xattr_list(i,read_xattr_id(i,0)).entries[0]
+            self.assertEqual((entry.out_of_line,entry.value,entry.out_of_line_reference),(False,value,None))
+
+class SquashFSXAttrOutOfLineDetectionTest(_XAttrFixture):
+    def test_ool_flag_is_detected(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0)),))
+        with d:self.assertTrue(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line)
+    def test_namespace_bits_are_independent_from_ool_flag(self):
+        d,i=self.list_image(((0x102,b'n',struct.pack('<Q',0)),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].namespace.prefix,b'security.')
+    def test_ool_raw_type_is_preserved_exactly(self):
+        d,i=self.list_image(((0x147,b'n',struct.pack('<Q',0)),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].raw_type,0x147)
+    def test_ool_out_of_line_is_true(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0)),))
+        with d:self.assertIs(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line,True)
+    def test_ool_value_is_none(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0)),))
+        with d:self.assertIsNone(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value)
+    def test_ool_reference_is_little_endian_u64(self):
+        ref=0x0102030405060708; d,i=self.list_image(((0x101,b'n',struct.pack('<Q',ref)),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line_reference,ref)
+    def test_ool_zero_reference_is_preserved(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0)),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line_reference,0)
+    def test_ool_nonzero_reference_is_preserved(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',9)),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line_reference,9)
+    def test_ool_maximum_u64_reference_is_preserved(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0xffffffffffffffff)),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line_reference,0xffffffffffffffff)
+    def test_ool_reference_with_zero_bytes_available_is_rejected(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0)),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|9))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_ool_reference_truncated_by_one_byte_is_rejected(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0)),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|16))
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_malformed_ool_representation_is_rejected(self):
+        raw=struct.pack('<HH',0x100,1)+b'n'+struct.pack('<I',7)+b'\0'*7; d,i,_=self.boundary_list_image(raw,1,len(raw),0)
+        with d:
+            with self.assertRaisesRegex(SquashFSXAttrValueError,'must be 8 bytes'):read_xattr_list(i,read_xattr_id(i,0))
+    def test_ool_reference_crosses_physical_metadata_boundary(self):
+        ref=0x0102030405060708; raw=struct.pack('<HH',0x100,1)+b'n'+struct.pack('<I',8)+struct.pack('<Q',ref); d,i,next_block=self.boundary_list_image(raw,1,len(raw),8181)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-2:],struct.pack('<Q',ref)[:2])
+            self.assertEqual(i.read_metadata_block(next_block).data[:6],struct.pack('<Q',ref)[2:])
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line_reference,ref)
+    def test_ool_reference_starts_at_final_payload_byte(self):
+        ref=0x0102030405060708; raw=struct.pack('<HH',0x100,1)+b'n'+struct.pack('<I',8)+struct.pack('<Q',ref); d,i,next_block=self.boundary_list_image(raw,1,len(raw),8182)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-1:],struct.pack('<Q',ref)[:1])
+            self.assertEqual(i.read_metadata_block(next_block).data[:7],struct.pack('<Q',ref)[1:])
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line_reference,ref)
+    def test_ool_reference_ends_exactly_at_payload_boundary(self):
+        ref=0x0102030405060708; raw=struct.pack('<HH',0x100,1)+b'n'+struct.pack('<I',8)+struct.pack('<Q',ref); d,i,next_block=self.boundary_list_image(raw,1,len(raw),8175)
+        with d:
+            self.assertEqual(i.read_metadata_block(128).data[-8:],struct.pack('<Q',ref))
+            self.assertEqual(next_block,128+2+METADATA_SIZE)
+            self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line_reference,ref)
+    def test_malformed_next_metadata_block_while_reading_ool_reference_is_wrapped(self):
+        raw=struct.pack('<HH',0x100,1)+b'n'+struct.pack('<I',8)+struct.pack('<Q',0); d,i,next_block=self.boundary_list_image(raw,1,len(raw),8181)
+        with d:
+            self.patch(i,next_block,b'\0\0')
+            with self.assertRaises(SquashFSXAttrValueError) as caught:read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+    def test_ool_is_never_exposed_as_inline_value_bytes(self):
+        raw=struct.pack('<Q',0x12340002); d,i=self.list_image(((0x101,b'n',raw),))
+        with d:self.assertNotEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,raw)
+    def test_ool_target_is_not_dereferenced(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0xffffffffffffffff)),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].out_of_line_reference,0xffffffffffffffff)
+    def test_malformed_ool_raises_typed_value_error(self):
+        raw=struct.pack('<HH',0x100,1)+b'n'+struct.pack('<I',1)+b'\0'; d,i,_=self.boundary_list_image(raw,1,len(raw),0)
+        with d:
+            with self.assertRaises(SquashFSXAttrValueError):read_xattr_list(i,read_xattr_id(i,0))
+    def test_metadata_failure_is_preserved_as_ool_value_error_cause(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0)),))
+        with d:
+            self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|16))
+            with self.assertRaises(SquashFSXAttrValueError) as caught:read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+
+class SquashFSXAttrListReaderTest(_XAttrFixture):
+    def test_one_entry(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertEqual(len(read_xattr_list(i,read_xattr_id(i,0)).entries),1)
+    def test_multiple_entries(self):
+        d,i=self.list_image(((0,b'a',b'1'),(2,b'b',b'22')))
+        with d:self.assertEqual(len(read_xattr_list(i,read_xattr_id(i,0)).entries),2)
+    def test_mixed_namespaces(self):
+        d,i=self.list_image(((0,b'a',b'1'),(1,b'b',b'2'),(2,b'c',b'3')))
+        with d:self.assertEqual([e.namespace.prefix for e in read_xattr_list(i,read_xattr_id(i,0)).entries],[b'user.',b'trusted.',b'security.'])
+    def test_mixed_inline_and_ool_entries(self):
+        d,i=self.list_image(((0,b'a',b'1'),(0x101,b'b',struct.pack('<Q',2))))
+        with d:self.assertEqual([e.out_of_line for e in read_xattr_list(i,read_xattr_id(i,0)).entries],[False,True])
+    def test_entry_order_is_preserved(self):
+        d,i=self.list_image(((0,b'first',b'1'),(0,b'second',b'2')))
+        with d:self.assertEqual([e.name for e in read_xattr_list(i,read_xattr_id(i,0)).entries],[b'first',b'second'])
+    def test_exact_declared_count(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).xattr_id.count,1)
+    def test_declared_count_smaller_than_entry_data_is_rejected(self):
+        entries=((0,b'a',b'1'),(0,b'b',b'2')); d,i=self.list_image(entries,ids=((0,1,20),))
+        with d:
+            with self.assertRaisesRegex(SquashFSXAttrListError,'size does not match'):read_xattr_list(i,read_xattr_id(i,0))
+    def test_declared_count_larger_than_available_entries_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'1'),),ids=((0,2,10),))
+        with d:self.assertRaises(SquashFSXAttrEntryError,read_xattr_list,i,read_xattr_id(i,0))
+    def test_zero_declared_count_with_zero_declared_size(self):
+        d,i=self.list_image((),ids=((0,0,0),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries,())
+    def test_zero_declared_count_with_trailing_data_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'1'),),ids=((0,0,10),))
+        with d:
+            with self.assertRaisesRegex(SquashFSXAttrListError,'size does not match'):read_xattr_list(i,read_xattr_id(i,0))
+    def test_exact_declared_size(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            value=read_xattr_list(i,read_xattr_id(i,0)); self.assertEqual(value.consumed_size,value.xattr_id.size)
+    def test_zero_alignment_padding_is_accepted_without_changing_consumed_size(self):
+        raw=struct.pack('<HH',0,1)+b'a'+struct.pack('<I',1)+b'v'+b'\0\0'; d,i,_=self.boundary_list_image(raw,1,len(raw),0)
+        with d:
+            value=read_xattr_list(i,read_xattr_id(i,0)); self.assertEqual((value.consumed_size,value.xattr_id.size),(10,12))
+    def test_declared_size_smaller_than_consumed_entry_bytes_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),),ids=((0,1,1),))
+        with d:
+            with self.assertRaisesRegex(SquashFSXAttrListError,'size does not match'):read_xattr_list(i,read_xattr_id(i,0))
+    def test_declared_size_larger_than_available_metadata_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),),ids=((0,1,0xffff),))
+        with d:self.assertRaises(SquashFSXAttrListError,read_xattr_list,i,read_xattr_id(i,0))
+    def test_declared_size_larger_than_consumed_with_trailing_bytes_is_rejected(self):
+        raw=struct.pack('<HH',0,1)+b'a'+struct.pack('<I',1)+b'v'+b'x'; d,i,_=self.boundary_list_image(raw,1,len(raw),0)
+        with d:
+            with self.assertRaisesRegex(SquashFSXAttrListError,'size does not match'):read_xattr_list(i,read_xattr_id(i,0))
+    def test_one_trailing_byte_after_final_entry_is_rejected(self):
+        raw=struct.pack('<HH',0,1)+b'a'+struct.pack('<I',1)+b'v'+b'x'; d,i,_=self.boundary_list_image(raw,1,len(raw),0)
+        with d:self.assertRaises(SquashFSXAttrListError,read_xattr_list,i,read_xattr_id(i,0))
+    def test_multiple_trailing_bytes_after_final_entry_are_rejected(self):
+        raw=struct.pack('<HH',0,1)+b'a'+struct.pack('<I',1)+b'v'+b'xyz'; d,i,_=self.boundary_list_image(raw,1,len(raw),0)
+        with d:self.assertRaises(SquashFSXAttrListError,read_xattr_list,i,read_xattr_id(i,0))
+    def test_consumed_size_is_exact(self):
+        d,i=self.list_image(((0,b'a',b'1'),(2,b'b',b'22')))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).consumed_size,21)
+    def test_declared_count_is_preserved(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).xattr_id.count,1)
+    def test_declared_size_is_preserved(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).xattr_id.size,10)
+    def test_list_entries_are_an_immutable_tuple(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertIsInstance(read_xattr_list(i,read_xattr_id(i,0)).entries,tuple)
+    def test_list_model_is_immutable(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            value=read_xattr_list(i,read_xattr_id(i,0))
+            with self.assertRaises(AttributeError):value.consumed_size=0
+    def test_id_zero_is_valid(self):
+        d,i=self.list_image(((0,b'a',b'zero'),))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,0)).entries[0].value,b'zero')
+    def test_nonzero_valid_id_is_valid(self):
+        d,i=self.multi_list_image((((0,b'a',b'zero'),),((0,b'b',b'one'),)))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,1)).entries[0].value,b'one')
+    def test_selected_record_matches_requested_id(self):
+        d,i=self.multi_list_image((((0,b'a',b'zero'),),((0,b'b',b'one'),)))
+        with d:self.assertEqual(read_xattr_list(i,read_xattr_id(i,1)).xattr_id.index,1)
+    def test_invalid_id_below_zero_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertRaises(SquashFSXAttrIDError,read_xattr_id,i,-1)
+    def test_invalid_id_equal_to_table_count_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertRaises(SquashFSXAttrIDError,read_xattr_id,i,1)
+    def test_invalid_id_larger_than_table_count_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertRaises(SquashFSXAttrIDError,read_xattr_id,i,2)
+    def test_absent_xattr_table_is_rejected(self):
+        d,i=self.xattr_image(absent=True)
+        with d:self.assertRaises(SquashFSXAttrTableError,read_xattr_id,i,0)
+    def test_empty_xattr_id_table_is_rejected(self):
+        d,i=self.xattr_image(())
+        with d:self.assertRaises(SquashFSXAttrTableError,read_xattr_id,i,0)
+    def test_malformed_id_record_is_wrapped(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,4096,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|2))
+            with self.assertRaises(SquashFSXAttrIDError) as caught:read_xattr_id(i,0)
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+    def test_malformed_list_metadata_is_wrapped(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,b'\0\0')
+            with self.assertRaises(SquashFSXAttrEntryError) as caught:read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+    def test_public_typed_list_error_is_raised(self):
+        d,i=self.list_image(((0,b'a',b'v'),),ids=((0,1,1),))
+        with d:self.assertRaises(SquashFSXAttrListError,read_xattr_list,i,read_xattr_id(i,0))
+    def test_lower_metadata_cause_is_preserved(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,b'\0\0')
+            with self.assertRaises(SquashFSXAttrListError) as caught:read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+    def test_count_mismatch_and_size_mismatch_have_distinct_messages(self):
+        d,i=self.list_image(((0,b'a',b'v'),),ids=((0,2,10),))
+        with d:
+            with self.assertRaises(SquashFSXAttrEntryError) as count_error:read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIn('entry 1',str(count_error.exception))
+        d,i=self.list_image(((0,b'a',b'v'),),ids=((0,1,1),))
+        with d:
+            with self.assertRaises(SquashFSXAttrListError) as size_error:read_xattr_list(i,read_xattr_id(i,0))
+            self.assertIn('size does not match',str(size_error.exception))
+    def test_id_zero_is_not_treated_as_absent(self):
+        d,i=self.list_image(((0,b'a',b'zero'),))
+        with d:self.assertIsNotNone(read_xattr_list(i,read_xattr_id(i,0)))
+    def test_list_parsing_is_lazy_until_requested(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            with patch.object(i,'read_metadata_block',wraps=i.read_metadata_block) as reads:
+                read_xattr_id(i,0)
+                self.assertNotIn(128,[call.args[0] for call in reads.call_args_list])
+                read_xattr_list(i,read_xattr_id(i,0))
+                self.assertIn(128,[call.args[0] for call in reads.call_args_list])
+
+class SquashFSXAttrInodeListIntegrationTest(_XAttrFixture):
+    def test_inode_without_xattr_id_returns_none(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            body=SquashFSBasicRegularInode(SquashFSInodeHeader(2,0,0,0,0,1),0,0,0,0)
+            inode=SquashFSInode(SquashFSMetadataReference(0,0),body.header,body)
+            self.assertIsNone(read_inode_xattrs(i,inode))
+    def test_inode_without_xattr_id_performs_no_metadata_read(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            body=SquashFSBasicRegularInode(SquashFSInodeHeader(2,0,0,0,0,1),0,0,0,0); inode=SquashFSInode(SquashFSMetadataReference(0,0),body.header,body)
+            with patch.object(i,'read_metadata_block',wraps=i.read_metadata_block) as reads:
+                self.assertIsNone(read_inode_xattrs(i,inode)); self.assertEqual(reads.call_count,0)
+    def test_inode_id_zero_returns_id_zero_list(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            inode=self.extended_inode(0)
+            self.assertEqual(read_inode_xattrs(i,inode).entries[0].value,b'v')
+    def test_inode_nonzero_id_returns_matching_list(self):
+        d,i=self.multi_list_image((((0,b'a',b'zero'),),((0,b'b',b'one'),)))
+        with d:self.assertEqual(read_inode_xattrs(i,self.extended_inode(1)).entries[0].value,b'one')
+    def test_two_inodes_with_different_ids_select_different_lists(self):
+        d,i=self.multi_list_image((((0,b'a',b'zero'),),((0,b'b',b'one'),)))
+        with d:self.assertEqual([read_inode_xattrs(i,self.extended_inode(n)).entries[0].value for n in (0,1)],[b'zero',b'one'])
+    def test_selected_entries_match_inode_id_record(self):
+        d,i=self.multi_list_image((((0,b'a',b'zero'),),((0,b'b',b'one'),)))
+        with d:
+            value=read_inode_xattrs(i,self.extended_inode(1)); self.assertEqual((value.xattr_id.index,value.entries[0].name),(1,b'b'))
+    def test_invalid_inode_xattr_id_is_rejected(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            with self.assertRaises(SquashFSXAttrInodeError) as caught:read_inode_xattrs(i,self.extended_inode(1))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSXAttrIDError)
+    def test_missing_xattr_table_for_inode_is_rejected(self):
+        d,i=self.xattr_image(absent=True)
+        with d:
+            with self.assertRaises(SquashFSXAttrInodeError) as caught:read_inode_xattrs(i,self.extended_inode(0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSXAttrTableError)
+    def test_physical_inode_parsing_is_lazy(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            with patch.object(i,'read_metadata_block',wraps=i.read_metadata_block) as reads:
+                inode=self.parsed_extended_inode(i,0); self.assertEqual(inode.body.xattr_id,0); self.assertNotIn(128,[call.args[0] for call in reads.call_args_list])
+    def test_parsing_inode_does_not_eagerly_parse_xattr_list(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            with patch.object(i,'read_metadata_block',wraps=i.read_metadata_block) as reads:
+                self.extended_inode(0); self.assertNotIn(128,[call.args[0] for call in reads.call_args_list])
+    def test_read_inode_xattrs_accesses_list_when_requested(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            inode=self.extended_inode(0)
+            with patch.object(i,'read_metadata_block',wraps=i.read_metadata_block) as reads:
+                read_inode_xattrs(i,inode); self.assertIn(128,[call.args[0] for call in reads.call_args_list])
+    def test_sentinel_xattr_decodes_to_none(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertIsNone(self.parsed_extended_inode(i,0xffffffff).body.xattr_id)
+    def test_valid_id_zero_remains_zero(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:self.assertEqual(self.parsed_extended_inode(i,0).body.xattr_id,0)
+    def test_sentinel_is_never_resolved_as_table_id(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            with patch.object(i,'read_metadata_block',wraps=i.read_metadata_block) as reads:
+                self.assertIsNone(read_inode_xattrs(i,self.extended_inode(0xffffffff)))
+                self.assertEqual(reads.call_count,0)
+    def test_id_table_error_is_wrapped_through_inode_api(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,4096,b'\0\0')
+            with self.assertRaises(SquashFSXAttrInodeError) as caught:read_inode_xattrs(i,self.extended_inode(0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSXAttrIDError)
+    def test_list_metadata_error_is_wrapped_through_inode_api(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,b'\0\0')
+            with self.assertRaises(SquashFSXAttrInodeError) as caught:read_inode_xattrs(i,self.extended_inode(0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSXAttrEntryError)
+    def test_inode_error_preserves_exact_cause_type(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,b'\0\0')
+            with self.assertRaises(SquashFSXAttrInodeError) as caught:read_inode_xattrs(i,self.extended_inode(0))
+            self.assertIsInstance(caught.exception.__cause__,SquashFSXAttrEntryError)
+    def test_inode_without_xattr_id_ignores_malformed_metadata(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,b'\0\0')
+            self.assertIsNone(read_inode_xattrs(i,self.extended_inode(0xffffffff)))
+    def test_inode_with_xattr_id_fails_for_malformed_selected_list(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            self.patch(i,128,b'\0\0')
+            with self.assertRaises(SquashFSXAttrInodeError):read_inode_xattrs(i,self.extended_inode(0))
+    def test_nonxattr_basic_inode_behavior_is_unchanged(self):
+        d,i=self.list_image(((0,b'a',b'v'),))
+        with d:
+            body=SquashFSBasicRegularInode(SquashFSInodeHeader(2,0,0,0,0,1),0,0,0,0); inode=SquashFSInode(SquashFSMetadataReference(0,0),body.header,body)
+            self.assertIsInstance(inode.body,SquashFSBasicRegularInode)
 
 if __name__ == "__main__":
     unittest.main()
