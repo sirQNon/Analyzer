@@ -28,6 +28,7 @@ from squashfs import (
     EXTENDED_SYMLINK_INODE_TYPE,
     DIRECTORY_INDEX_STRUCT,
     SQUASHFS_INVALID_BLK,
+    XATTR_ID_STRUCT,
     DIRECTORY_ENTRY_SIZE,
     DIRECTORY_ENTRY_STRUCT,
     DIRECTORY_HEADER_SIZE,
@@ -37,6 +38,7 @@ from squashfs import (
     INODE_HEADER_SIZE,
     INODE_HEADER_STRUCT,
     METADATA_UNCOMPRESSED_BIT,
+    METADATA_SIZE,
     FRAGMENT_ENTRY_STRUCT,
     FRAGMENT_ENTRIES_PER_METADATA_BLOCK,
     FRAGMENT_INDEX_POINTER_STRUCT,
@@ -55,6 +57,11 @@ from squashfs import (
     SquashFSExtendedSymlinkInode,
     SquashFSInodeLookupIndexError,
     SquashFSInodeLookupEntryError,
+    SquashFSXAttrTableError,
+    SquashFSXAttrIDError,
+    read_xattr_id_table,
+    read_xattr_id,
+    decode_xattr_reference,
     SquashFSInodeLookupTableError,
     SquashFSDirectoryIndex,
     SquashFSDirectoryEntry,
@@ -1824,6 +1831,236 @@ class SquashFSFragmentBackedRegularFileReaderTest(unittest.TestCase):
 
         self.fail("UDM Pro ROOTFS has no fragment-backed basic regular inode")
 
+
+class _XAttrFixture(unittest.TestCase):
+    def xattr_image(self, records=((0x10000, 1, 2),), *, compressed=False, absent=False):
+        d=tempfile.TemporaryDirectory(); p=Path(d.name)/'xattr.sqfs'; metadata=4096
+        if absent:
+            b=bytearray(256); sb=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,len(b),0,SQUASHFS_INVALID_BLK,0,0,0,0);b[:len(sb)]=sb;p.write_bytes(b);return d,SquashFSImage(p)
+        payload=b''.join(XATTR_ID_STRUCT.pack(*r) for r in records)
+        chunks=[payload[pos:pos+METADATA_SIZE] for pos in range(0,len(payload),METADATA_SIZE)]
+        if not chunks: chunks=[b'']
+        blocks=[]; offsets=[]; cursor=metadata
+        for chunk in chunks:
+            stored=zstandard.ZstdCompressor().compress(chunk) if compressed else chunk
+            header=len(stored) if compressed else METADATA_UNCOMPRESSED_BIT|len(stored)
+            offsets.append(cursor); blocks.append(struct.pack('<H',header)+stored); cursor+=2+len(stored)
+        table=cursor; end=table+16+8*len(offsets); b=bytearray(end);sb=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,end,0,table,0,0,0,0)
+        b[:len(sb)]=sb
+        for offset, block in zip(offsets,blocks): b[offset:offset+len(block)]=block
+        b[table:table+16]=struct.pack('<QII',128,len(records),7)
+        for pos, offset in enumerate(offsets): b[table+16+8*pos:table+24+8*pos]=struct.pack('<Q',offset)
+        p.write_bytes(b);return d,SquashFSImage(p)
+    def patch(self, image, offset, data):
+        with image.image.open('r+b') as source: source.seek(offset); source.write(data)
+        image.superblock=None
+
+class SquashFSXAttrIDTableReaderTest(_XAttrFixture):
+    def test_rootfs_optional_table_discovery(self):
+        image=SquashFSImage(ROOTFS); table=read_xattr_id_table(image)
+        if image.read_superblock().xattr_id_table_start == SQUASHFS_INVALID_BLK: self.assertIsNone(table)
+        else: self.assertIsNotNone(table)
+    def test_absent_table_returns_none(self):
+        d,i=self.xattr_image(absent=True)
+        with d:self.assertIsNone(read_xattr_id_table(i))
+    def test_one_xattr_id(self):
+        d,i=self.xattr_image()
+        with d:self.assertEqual(read_xattr_id_table(i).xattr_ids,1)
+    def test_zero_ids_rejected(self):
+        d,i=self.xattr_image(())
+        with d:self.assertRaises(SquashFSXAttrTableError,read_xattr_id_table,i)
+    def test_index_count_one(self):
+        d,i=self.xattr_image()
+        with d:self.assertEqual(len(read_xattr_id_table(i).metadata_block_offsets),1)
+    def test_unused_is_preserved(self):
+        d,i=self.xattr_image()
+        with d:self.assertEqual(read_xattr_id_table(i).unused,7)
+    def test_table_is_immutable(self):
+        d,i=self.xattr_image()
+        with d:
+            t=read_xattr_id_table(i)
+            with self.assertRaises(AttributeError):t.xattr_ids=2
+    def test_truncated_table_header_has_typed_error(self):
+        d,i=self.xattr_image()
+        with d:
+            sb=i.read_superblock()
+            with i.image.open('r+b') as source: source.truncate(sb.xattr_id_table_start+8)
+            i.superblock=None
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_table_start_outside_backing_image_is_rejected(self):
+        d,i=self.xattr_image()
+        with d:
+            sb=i.read_superblock(); self.patch(i,56,struct.pack('<Q',i.image.stat().st_size+1))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_header_partially_outside_backing_image_is_rejected(self):
+        d,i=self.xattr_image()
+        with d:
+            self.patch(i,56,struct.pack('<Q',i.image.stat().st_size-8))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_truncated_index_has_typed_error(self):
+        d,i=self.xattr_image()
+        with d:
+            sb=i.read_superblock(); self.patch(i,sb.xattr_id_table_start+8,struct.pack('<I',513))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_extra_bytes_after_index_are_rejected(self):
+        d,i=self.xattr_image()
+        with d:
+            self.patch(i,40,struct.pack('<Q',i.image.stat().st_size+1))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_first_metadata_offset_outside_filesystem_is_rejected(self):
+        d,i=self.xattr_image()
+        with d:
+            sb=i.read_superblock(); self.patch(i,sb.xattr_id_table_start+16,struct.pack('<Q',sb.bytes_used))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_duplicate_metadata_offsets_are_rejected(self):
+        d,i=self.xattr_image(tuple((0,0,0) for _ in range(513)))
+        with d:
+            sb=i.read_superblock(); first=i.image.read_bytes()[sb.xattr_id_table_start+16:sb.xattr_id_table_start+24]; self.patch(i,sb.xattr_id_table_start+24,first)
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_non_increasing_metadata_offsets_are_rejected(self):
+        d,i=self.xattr_image(tuple((0,0,0) for _ in range(513)))
+        with d:
+            sb=i.read_superblock(); self.patch(i,sb.xattr_id_table_start+24,struct.pack('<Q',4095))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_excessive_metadata_block_distance_is_rejected(self):
+        d,i=self.xattr_image(tuple((0,0,0) for _ in range(513)))
+        with d:
+            sb=i.read_superblock(); self.patch(i,sb.xattr_id_table_start+24,struct.pack('<Q',4096+METADATA_SIZE+3))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_xattr_data_start_equal_to_first_metadata_is_rejected(self):
+        d,i=self.xattr_image()
+        with d:
+            sb=i.read_superblock(); self.patch(i,sb.xattr_id_table_start,struct.pack('<Q',4096))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_xattr_data_start_before_first_metadata_is_accepted(self):
+        d,i=self.xattr_image()
+        with d:self.assertEqual(read_xattr_id_table(i).xattr_table_start,128)
+    def test_xattr_data_start_after_first_metadata_is_rejected(self):
+        d,i=self.xattr_image()
+        with d:
+            sb=i.read_superblock(); self.patch(i,sb.xattr_id_table_start,struct.pack('<Q',4097))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_last_metadata_offset_must_precede_table(self):
+        d,i=self.xattr_image()
+        with d:
+            sb=i.read_superblock(); self.patch(i,sb.xattr_id_table_start+16,struct.pack('<Q',sb.xattr_id_table_start))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+    def test_excessive_distance_from_last_metadata_block_is_rejected(self):
+        d,i=self.xattr_image()
+        with d:
+            sb=i.read_superblock(); self.patch(i,sb.xattr_id_table_start+16,struct.pack('<Q',128))
+            with self.assertRaises(SquashFSXAttrTableError): read_xattr_id_table(i)
+
+class SquashFSXAttrIDReaderTest(_XAttrFixture):
+    def test_index_zero(self):
+        d,i=self.xattr_image()
+        with d:self.assertEqual(read_xattr_id(i,0).index,0)
+    def test_reference_decoding(self):
+        d,i=self.xattr_image(((0x1234ffff,3,4),))
+        with d:self.assertEqual((read_xattr_id(i,0).reference.block,read_xattr_id(i,0).reference.offset),(0x1234,0xffff))
+    def test_count_is_little_endian(self):
+        d,i=self.xattr_image(((0x10000,0x11223344,0x55667788),))
+        with d:self.assertEqual(read_xattr_id(i,0).count,0x11223344)
+    def test_size_is_little_endian(self):
+        d,i=self.xattr_image(((0x10000,0x11223344,0x55667788),))
+        with d:self.assertEqual(read_xattr_id(i,0).size,0x55667788)
+    def test_negative_index_rejected(self):
+        d,i=self.xattr_image()
+        with d:self.assertRaises(SquashFSXAttrIDError,read_xattr_id,i,-1)
+    def test_upper_index_rejected(self):
+        d,i=self.xattr_image()
+        with d:self.assertRaises(SquashFSXAttrIDError,read_xattr_id,i,1)
+    def test_compressed_metadata(self):
+        d,i=self.xattr_image(compressed=True)
+        with d:self.assertEqual(read_xattr_id(i,0).count,1)
+    def test_uncompressed_metadata(self):
+        d, i = self.xattr_image(compressed=False)
+        with d:
+            self.assertEqual(read_xattr_id(i, 0).count, 1)
+    def test_missing_table_rejected(self):
+        d,i=self.xattr_image(absent=True)
+        with d:self.assertRaises(SquashFSXAttrTableError,read_xattr_id,i,0)
+    def test_models_are_immutable(self):
+        d,i=self.xattr_image()
+        with d:
+            x=read_xattr_id(i,0)
+            with self.assertRaises(AttributeError):x.count=3
+    def test_record_at_offset_8176(self):
+        d,i=self.xattr_image(tuple((0x10000, n, n + 1) for n in range(513)))
+        with d:self.assertEqual(read_xattr_id(i,511).count,511)
+    def test_next_record_uses_next_metadata_block(self):
+        d,i=self.xattr_image(tuple((0x10000, n, n + 1) for n in range(513)))
+        with d:self.assertEqual(read_xattr_id(i,512).count,512)
+    def test_metadata_error_is_wrapped_with_cause(self):
+        d,i=self.xattr_image()
+        with d:
+            with i.image.open('r+b') as source: source.seek(4096); source.write(b'\xff\x7f')
+            with self.assertRaises(SquashFSXAttrIDError) as caught: read_xattr_id(i,0)
+            self.assertIsNotNone(caught.exception.__cause__)
+    def test_middle_index_reads_its_record(self):
+        d,i=self.xattr_image(((0,1,2),(1,3,4),(2,5,6)))
+        with d:self.assertEqual(read_xattr_id(i,1).count,3)
+    def test_last_valid_index_reads_its_record(self):
+        d,i=self.xattr_image(((0,1,2),(1,3,4),(2,5,6)))
+        with d:self.assertEqual(read_xattr_id(i,2).size,6)
+    def test_index_above_upper_bound_is_rejected(self):
+        d,i=self.xattr_image()
+        with d:self.assertRaises(SquashFSXAttrIDError,read_xattr_id,i,2)
+    def test_zero_reference_offset_decodes(self):
+        d,i=self.xattr_image(((0x10000,1,2),(0x2ffff,3,4)))
+        with d:self.assertEqual(read_xattr_id(i,0).reference.offset,0)
+    def test_maximum_reference_offset_decodes(self):
+        d,i=self.xattr_image(((0x10000,1,2),(0x2ffff,3,4)))
+        with d:self.assertEqual(read_xattr_id(i,1).reference.offset,0xffff)
+    def test_truncated_record_has_typed_error_and_cause(self):
+        d,i=self.xattr_image()
+        with d:
+            self.patch(i,4096,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|8))
+            with self.assertRaises(SquashFSXAttrIDError) as caught: read_xattr_id(i,0)
+            self.assertIsNotNone(caught.exception.__cause__)
+    def test_reference_model_is_immutable(self):
+        d,i=self.xattr_image()
+        with d:
+            with self.assertRaises(AttributeError): read_xattr_id(i,0).reference.block=1
+
+class SquashFSXAttrInodeIntegrationTest(unittest.TestCase):
+    def test_extended_directory_sentinel_maps_none(self): self.assertIsNone(SquashFSExtendedDirectoryInode(SquashFSInodeHeader(8,0,0,0,0,1),0,0,0,0,0,0,0xffffffff).xattr_id)
+    def test_extended_directory_zero_is_valid(self): self.assertEqual(SquashFSExtendedDirectoryInode(SquashFSInodeHeader(8,0,0,0,0,1),0,0,0,0,0,0,0).xattr_id,0)
+    def test_extended_regular_sentinel_maps_none(self): self.assertIsNone(SquashFSExtendedRegularInode(SquashFSInodeHeader(9,0,0,0,0,1),0,0,0,0,0,0,0xffffffff).xattr_id)
+    def test_extended_regular_zero_is_valid(self): self.assertEqual(SquashFSExtendedRegularInode(SquashFSInodeHeader(9,0,0,0,0,1),0,0,0,0,0,0,0).xattr_id,0)
+    def test_extended_symlink_sentinel_maps_none(self): self.assertIsNone(SquashFSExtendedSymlinkInode(SquashFSInodeHeader(10,0,0,0,0,1),0,0,0xffffffff).xattr_id)
+    def test_extended_symlink_zero_is_valid(self): self.assertEqual(SquashFSExtendedSymlinkInode(SquashFSInodeHeader(10,0,0,0,0,1),0,0,0).xattr_id,0)
+    def test_extended_directory_nonzero_is_preserved(self): self.assertEqual(SquashFSExtendedDirectoryInode(SquashFSInodeHeader(8,0,0,0,0,1),0,0,0,0,0,0,7).xattr_id,7)
+    def test_extended_regular_nonzero_is_preserved(self): self.assertEqual(SquashFSExtendedRegularInode(SquashFSInodeHeader(9,0,0,0,0,1),0,0,0,0,0,0,7).xattr_id,7)
+    def test_extended_symlink_nonzero_is_preserved(self): self.assertEqual(SquashFSExtendedSymlinkInode(SquashFSInodeHeader(10,0,0,0,0,1),0,0,7).xattr_id,7)
+    def test_basic_directory_has_no_xattr_id(self): self.assertFalse(hasattr(SquashFSBasicDirectoryInode(SquashFSInodeHeader(1,0,0,0,0,1),0,0,0,0,0),'xattr_id'))
+    def test_basic_regular_has_no_xattr_id(self): self.assertFalse(hasattr(SquashFSBasicRegularInode(SquashFSInodeHeader(2,0,0,0,0,1),0,0,0,0),'xattr_id'))
+    def test_basic_symlink_has_no_xattr_id(self): self.assertFalse(hasattr(SquashFSBasicSymlinkInode(SquashFSInodeHeader(3,0,0,0,0,1),0,0),'xattr_id'))
+    def test_inode_id_selects_production_xattr_record(self):
+        fixture=_XAttrFixture(); d,i=fixture.xattr_image(((0,11,12),(1,13,14)))
+        with d:
+            inode=SquashFSExtendedRegularInode(SquashFSInodeHeader(9,0,0,0,0,1),0,0,0,0,0,0,1)
+            self.assertEqual(read_xattr_id(i,inode.xattr_id).count,13)
+    def test_inode_xattr_property_does_not_eagerly_read_metadata(self):
+        inode=SquashFSExtendedRegularInode(SquashFSInodeHeader(9,0,0,0,0,1),0,0,0,0,0,0,0)
+        self.assertEqual(inode.xattr_id,0)
+
+class SquashFSXAttrRootfsTest(unittest.TestCase):
+    def test_rootfs_xattr_id_table_facts(self):
+        image=SquashFSImage(ROOTFS); sb=image.read_superblock(); table=read_xattr_id_table(image); item=read_xattr_id(image,0,table)
+        self.assertIsNotNone(table); self.assertEqual((sb.bytes_used,sb.xattr_id_table_start,table.xattr_table_start,table.xattr_ids,table.unused,table.metadata_block_offsets),(609067236,609067212,609067154,1,115,(609067194,)))
+        self.assertEqual((item.encoded_reference,item.reference.block,item.reference.offset,item.count,item.size),(0,0,0,1,40))
+        self.assertEqual(table.table_start+16+8*len(table.metadata_block_offsets),sb.bytes_used)
+    def test_rootfs_extended_inode_xattr_ids_are_in_range(self):
+        image=SquashFSImage(ROOTFS); sb=image.read_superblock(); table=read_xattr_id_table(image); lookup=read_inode_lookup_table(image); stream=SquashFSMetadataStream(image,sb.inode_table_start)
+        values=[]; extended=0
+        for number in range(1,lookup.inode_count+1):
+            body=resolve_inode_number(image,stream,lookup,number).body
+            if isinstance(body,(SquashFSExtendedDirectoryInode,SquashFSExtendedRegularInode,SquashFSExtendedSymlinkInode)):
+                extended+=1
+                if body.xattr_id is not None: values.append(body.xattr_id)
+        self.assertEqual((extended,len(values),min(values),max(values)),(23,1,0,0))
+        self.assertTrue(all(0<=value<table.xattr_ids for value in values))
 
 if __name__ == "__main__":
     unittest.main()

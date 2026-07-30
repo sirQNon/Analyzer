@@ -63,6 +63,9 @@ DIRECTORY_POSITION_OFFSET = 3
 SQUASHFS_INVALID_BLK = 0xFFFFFFFFFFFFFFFF
 INODE_LOOKUP_ENTRY_STRUCT = struct.Struct("<Q")
 INODE_LOOKUP_ENTRY_SIZE = INODE_LOOKUP_ENTRY_STRUCT.size
+XATTR_ID_TABLE_STRUCT = struct.Struct("<QII")
+XATTR_ID_STRUCT = struct.Struct("<QII")
+XATTR_ID_SIZE = XATTR_ID_STRUCT.size
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,31 @@ class SquashFSInodeLookupTable:
 
 
 @dataclass(frozen=True)
+class SquashFSXAttrReference:
+    """Relative metadata reference stored by a SquashFS xattr ID."""
+    block: int
+    offset: int
+
+
+@dataclass(frozen=True)
+class SquashFSXAttrID:
+    index: int
+    encoded_reference: int
+    count: int
+    size: int
+    reference: SquashFSXAttrReference
+
+
+@dataclass(frozen=True)
+class SquashFSXAttrIDTable:
+    table_start: int
+    xattr_table_start: int
+    xattr_ids: int
+    metadata_block_offsets: tuple[int, ...]
+    unused: int
+
+
+@dataclass(frozen=True)
 class SquashFSInodeHeader:
     """The common on-disk prefix of every SquashFS inode."""
 
@@ -179,6 +207,9 @@ class SquashFSExtendedRegularInode:
     fragment: int
     offset: int
     xattr: int
+    @property
+    def xattr_id(self) -> int | None:
+        return None if self.xattr == 0xffffffff else self.xattr
 
 
 @dataclass(frozen=True)
@@ -192,6 +223,9 @@ class SquashFSExtendedDirectoryInode:
     i_count: int
     offset: int
     xattr: int
+    @property
+    def xattr_id(self) -> int | None:
+        return None if self.xattr == 0xffffffff else self.xattr
 
 @dataclass(frozen=True)
 class SquashFSExtendedSymlinkInode:
@@ -199,6 +233,9 @@ class SquashFSExtendedSymlinkInode:
     nlink: int
     symlink_size: int
     xattr: int
+    @property
+    def xattr_id(self) -> int | None:
+        return None if self.xattr == 0xffffffff else self.xattr
 
 
 @dataclass(frozen=True)
@@ -313,6 +350,18 @@ class SquashFSInodeLookupIndexError(SquashFSInodeLookupError):
 
 class SquashFSInodeLookupEntryError(SquashFSInodeLookupError):
     """A logical lookup entry cannot be read or decoded."""
+
+
+class SquashFSXAttrError(ValueError):
+    """Invalid SquashFS xattr ID-table data."""
+
+
+class SquashFSXAttrTableError(SquashFSXAttrError):
+    """The xattr ID table header or index is invalid."""
+
+
+class SquashFSXAttrIDError(SquashFSXAttrError):
+    """An xattr ID is outside range or cannot be read."""
 
 
 class SquashFSUnsupportedInodeTypeError(SquashFSInodeError):
@@ -452,6 +501,77 @@ def resolve_inode_number(image: SquashFSImage, inode_stream: SquashFSMetadataStr
         return read_inode(inode_stream, SquashFSMetadataReference(reference.block, reference.offset))
     except (SquashFSInodeError, SquashFSMetadataStreamError) as error:
         raise SquashFSInodeLookupEntryError("Lookup inode reference cannot be resolved") from error
+
+
+def decode_xattr_reference(value: int) -> SquashFSXAttrReference:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0xffffffffffffffff:
+        raise TypeError("Xattr reference must be an unsigned 64-bit integer")
+    return SquashFSXAttrReference(value >> 16, value & 0xffff)
+
+
+def _xattr_index_count(xattr_ids: int) -> int:
+    if not isinstance(xattr_ids, int) or isinstance(xattr_ids, bool) or xattr_ids <= 0:
+        raise SquashFSXAttrTableError("Xattr ID count must be positive")
+    # On-disk count is u32, nevertheless retain an explicit checked bound.
+    if xattr_ids > 0xffffffff or xattr_ids > ((1 << 63) - 1) // XATTR_ID_SIZE:
+        raise SquashFSXAttrTableError("Xattr ID count is unsafe")
+    return (xattr_ids * XATTR_ID_SIZE + METADATA_SIZE - 1) // METADATA_SIZE
+
+
+def read_xattr_id_table(image: SquashFSImage) -> SquashFSXAttrIDTable | None:
+    """Read the xattr-ID header and its uncompressed metadata-block index."""
+    if not isinstance(image, SquashFSImage):
+        raise TypeError("Xattr table image has an invalid type")
+    superblock = image.superblock or image.read_superblock()
+    table_start = superblock.xattr_id_table_start
+    if table_start == SQUASHFS_INVALID_BLK:
+        return None
+    image_size = image.image.stat().st_size
+    filesystem_end = superblock.bytes_used
+    if filesystem_end > image_size or table_start < 0 or table_start + XATTR_ID_TABLE_STRUCT.size > filesystem_end:
+        raise SquashFSXAttrTableError("Xattr ID table header bounds are invalid")
+    with image.image.open("rb") as source:
+        source.seek(table_start)
+        header = source.read(XATTR_ID_TABLE_STRUCT.size)
+    if len(header) != XATTR_ID_TABLE_STRUCT.size:
+        raise SquashFSXAttrTableError("Xattr ID table header is truncated")
+    xattr_table_start, xattr_ids, unused = XATTR_ID_TABLE_STRUCT.unpack(header)
+    count = _xattr_index_count(xattr_ids)
+    index_start = table_start + XATTR_ID_TABLE_STRUCT.size
+    index_size = count * 8
+    if index_start + index_size != filesystem_end:
+        raise SquashFSXAttrTableError("Xattr ID index size does not match filesystem end")
+    with image.image.open("rb") as source:
+        source.seek(index_start); data = source.read(index_size)
+    if len(data) != index_size:
+        raise SquashFSXAttrTableError("Xattr ID index is truncated")
+    offsets = tuple(INODE_LOOKUP_ENTRY_STRUCT.unpack_from(data, p)[0] for p in range(0, index_size, 8))
+    previous = -1
+    for offset in offsets:
+        if offset >= filesystem_end or offset <= previous or offset >= table_start or (previous >= 0 and offset - previous > METADATA_SIZE + METADATA_HEADER_SIZE):
+            raise SquashFSXAttrTableError("Xattr ID metadata offsets are invalid")
+        previous = offset
+    if table_start - previous > METADATA_SIZE + METADATA_HEADER_SIZE or xattr_table_start >= offsets[0]:
+        raise SquashFSXAttrTableError("Xattr ID table layout is invalid")
+    return SquashFSXAttrIDTable(table_start, xattr_table_start, xattr_ids, offsets, unused)
+
+
+def read_xattr_id(image: SquashFSImage, index: int, table: SquashFSXAttrIDTable | None = None) -> SquashFSXAttrID:
+    """Lazily read one zero-based `squashfs_xattr_id` record."""
+    if table is None:
+        table = read_xattr_id_table(image)
+    if table is None:
+        raise SquashFSXAttrTableError("Xattr ID table is unavailable")
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < table.xattr_ids:
+        raise SquashFSXAttrIDError("Xattr ID index is outside table range")
+    byte_offset = index * XATTR_ID_SIZE
+    block_index, block_offset = divmod(byte_offset, METADATA_SIZE)
+    try:
+        data = SquashFSMetadataStream(image, table.metadata_block_offsets[block_index]).read(SquashFSMetadataReference(0, block_offset), XATTR_ID_SIZE)
+        encoded, count, size = XATTR_ID_STRUCT.unpack(data)
+    except (SquashFSMetadataError, SquashFSMetadataStreamError, struct.error, IndexError) as error:
+        raise SquashFSXAttrIDError("Cannot read xattr ID") from error
+    return SquashFSXAttrID(index, encoded, count, size, decode_xattr_reference(encoded))
 
 
 def parse_inode_header(data: bytes) -> SquashFSInodeHeader:
