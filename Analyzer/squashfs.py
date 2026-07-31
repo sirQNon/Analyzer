@@ -618,6 +618,7 @@ def read_xattr_id(image: SquashFSImage, index: int, table: SquashFSXAttrIDTable 
 
 XATTR_ENTRY_STRUCT = struct.Struct("<HH")
 XATTR_VALUE_STRUCT = struct.Struct("<I")
+XATTR_VALUE_OOL_STRUCT = struct.Struct("<I")
 XATTR_VALUE_OOL = 0x100
 XATTR_PREFIX_MASK = 0xff
 XATTR_PREFIXES = {0: b"user.", 1: b"trusted.", 2: b"security."}
@@ -711,6 +712,135 @@ def read_xattr_list(image: SquashFSImage, xattr_id: SquashFSXAttrID, table: Squa
         if padding != b"\0" * padding_size:
             raise SquashFSXAttrListError("Xattr list size does not match ID record")
     return SquashFSXAttrList(xattr_id, tuple(entries), consumed)
+
+
+def _validate_xattr_ool_metadata_range(
+    stream: SquashFSMetadataStream,
+    reference: SquashFSMetadataReference,
+    size: int,
+    region_end: int,
+    truncated_message: str,
+) -> None:
+    """Prove a metadata range stays in the XAttr-value region before reading it."""
+    if reference.byte_offset > METADATA_SIZE:
+        raise SquashFSXAttrValueError("Invalid out-of-line xattr reference offset")
+    if size == 0:
+        return
+
+    current_offset = stream.table_start + reference.block_offset
+    current_byte_offset = reference.byte_offset
+    remaining = size
+    while remaining:
+        if current_offset < stream.table_start or current_offset >= region_end:
+            raise SquashFSXAttrValueError("Invalid out-of-line xattr reference")
+        block = stream.image.read_metadata_block(current_offset)
+        if current_byte_offset > len(block.data):
+            raise SquashFSXAttrValueError("Invalid out-of-line xattr reference offset")
+        available = len(block.data) - current_byte_offset
+        if available == 0:
+            if block.next_offset >= region_end:
+                raise SquashFSXAttrValueError(truncated_message)
+            current_offset = block.next_offset
+            current_byte_offset = 0
+            continue
+        remaining -= min(remaining, available)
+        if remaining and block.next_offset >= region_end:
+            raise SquashFSXAttrValueError(truncated_message)
+        current_offset = block.next_offset
+        current_byte_offset = 0
+
+
+def read_xattr_out_of_line_value(
+    image: SquashFSImage,
+    entry: SquashFSXAttrEntry,
+    table: SquashFSXAttrIDTable | None = None,
+) -> bytes:
+    """Lazily resolve and return the opaque bytes of one OOL XAttr value."""
+    if not isinstance(entry, SquashFSXAttrEntry):
+        raise SquashFSXAttrValueError("Out-of-line xattr entry has an invalid type")
+    if not entry.out_of_line:
+        raise SquashFSXAttrValueError("Xattr entry is not out-of-line")
+    if entry.value is not None:
+        raise SquashFSXAttrValueError("Out-of-line xattr entry has an inline value")
+    if entry.out_of_line_reference is None:
+        raise SquashFSXAttrValueError("Out-of-line xattr entry is missing its reference")
+    if not isinstance(image, SquashFSImage):
+        raise SquashFSXAttrValueError("Out-of-line xattr image has an invalid type")
+
+    try:
+        # The decoded entry is self-contained, but the table supplies the XAttr
+        # metadata-table origin and the boundary before the ID metadata region.
+        table = read_xattr_id_table(image) if table is None else table
+        if not isinstance(table, SquashFSXAttrIDTable):
+            raise SquashFSXAttrValueError("Xattr ID table is unavailable")
+        if not table.metadata_block_offsets:
+            raise SquashFSXAttrValueError("Xattr ID table has no metadata boundary")
+        if not all(isinstance(value, int) and not isinstance(value, bool) for value in (
+            table.xattr_table_start, table.table_start, table.metadata_block_offsets[0]
+        )):
+            raise SquashFSXAttrValueError("Xattr ID table has invalid metadata bounds")
+        superblock = image.superblock or image.read_superblock()
+        image_size = image.image.stat().st_size
+        region_end = table.metadata_block_offsets[0]
+        if (
+            superblock.bytes_used > image_size
+            or table.xattr_table_start < 0
+            or region_end <= table.xattr_table_start
+            or region_end > table.table_start
+            or table.table_start > superblock.bytes_used
+        ):
+            raise SquashFSXAttrValueError("Xattr ID table has invalid metadata bounds")
+
+        try:
+            reference = decode_xattr_reference(entry.out_of_line_reference)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise SquashFSXAttrValueError("Invalid out-of-line xattr reference") from error
+        target_start = table.xattr_table_start + reference.block
+        if target_start < table.xattr_table_start or target_start >= region_end:
+            raise SquashFSXAttrValueError("Invalid out-of-line xattr reference")
+        if reference.offset >= METADATA_SIZE:
+            raise SquashFSXAttrValueError("Invalid out-of-line xattr reference offset")
+        stream = SquashFSMetadataStream(image, target_start)
+        target = SquashFSMetadataReference(0, reference.offset)
+
+        try:
+            _validate_xattr_ool_metadata_range(
+                stream, target, XATTR_VALUE_OOL_STRUCT.size, region_end,
+                "Truncated out-of-line xattr target header",
+            )
+            header = stream.read(target, XATTR_VALUE_OOL_STRUCT.size)
+            value_size = XATTR_VALUE_OOL_STRUCT.unpack(header)[0]
+            value_reference = stream.advance_reference(target, XATTR_VALUE_OOL_STRUCT.size)
+        except SquashFSXAttrValueError:
+            raise
+        except (SquashFSMetadataError, SquashFSMetadataStreamError, struct.error,
+                IndexError, OverflowError, OSError, TypeError, ValueError) as error:
+            raise SquashFSXAttrValueError(
+                "Truncated out-of-line xattr target header"
+            ) from error
+
+        # Preflight first: a u32 value is format-valid, but must fit in the
+        # physically bounded XAttr metadata region before it is assembled.
+        try:
+            _validate_xattr_ool_metadata_range(
+                stream, value_reference, value_size, region_end,
+                "Impossible declared out-of-line xattr value size",
+            )
+            return stream.read(value_reference, value_size)
+        except SquashFSXAttrValueError:
+            raise
+        except (SquashFSMetadataError, SquashFSMetadataStreamError, struct.error,
+                IndexError, OverflowError, OSError, TypeError, ValueError) as error:
+            raise SquashFSXAttrValueError(
+                "Truncated out-of-line xattr target value"
+            ) from error
+    except SquashFSXAttrValueError:
+        raise
+    except (SquashFSXAttrError, SquashFSMetadataError, SquashFSMetadataStreamError,
+            struct.error, AttributeError, IndexError, OverflowError, OSError, TypeError, ValueError) as error:
+        raise SquashFSXAttrValueError(
+            "Invalid or truncated out-of-line xattr value"
+        ) from error
 
 
 def read_inode_xattrs(image: SquashFSImage, inode: SquashFSInode, table: SquashFSXAttrIDTable | None = None) -> SquashFSXAttrList | None:

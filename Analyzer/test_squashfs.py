@@ -63,12 +63,15 @@ from squashfs import (
     SquashFSXAttrEntryError,
     SquashFSXAttrValueError,
     SquashFSXAttrInodeError,
+    SquashFSXAttrEntry,
+    SquashFSXAttrIDTable,
     decode_xattr_namespace,
     read_xattr_list,
     read_inode_xattrs,
     read_xattr_id_table,
     read_xattr_id,
     decode_xattr_reference,
+    read_xattr_out_of_line_value,
     SquashFSInodeLookupTableError,
     SquashFSDirectoryIndex,
     SquashFSDirectoryEntry,
@@ -2439,6 +2442,198 @@ class SquashFSXAttrOutOfLineDetectionTest(_XAttrFixture):
             self.patch(i,128,struct.pack('<H',METADATA_UNCOMPRESSED_BIT|16))
             with self.assertRaises(SquashFSXAttrValueError) as caught:read_xattr_list(i,read_xattr_id(i,0))
             self.assertIsInstance(caught.exception.__cause__,SquashFSMetadataStreamError)
+
+class SquashFSXAttrOutOfLineValueStage20C1Test(_XAttrFixture):
+    """Focused physical-fixture coverage for Stage 20 OOL value resolution."""
+    def target_image(self, target: bytes):
+        d=tempfile.TemporaryDirectory(); p=Path(d.name)/'ool-value.sqfs'; xstart=128
+        idmeta=xstart+2+len(target)+16; table=idmeta+18; end=table+24
+        raw=bytearray(end); raw[:96]=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,end,0,table,0,0,0,0)
+        raw[xstart:xstart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(target)); raw[xstart+2:xstart+2+len(target)]=target
+        raw[idmeta:idmeta+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|16); raw[idmeta+2:idmeta+18]=XATTR_ID_STRUCT.pack(0,1,0)
+        raw[table:table+16]=struct.pack('<QII',xstart,1,0); raw[table+16:table+24]=struct.pack('<Q',idmeta)
+        p.write_bytes(raw); return d,SquashFSImage(p)
+    @staticmethod
+    def entry(reference=0):
+        return SquashFSXAttrEntry(0x100,decode_xattr_namespace(0),b'n',b'user.n',None,8,True,reference)
+    def resolve(self, target, reference=0, table=None):
+        d,i=self.target_image(target); self.addCleanup(d.cleanup)
+        return i,read_xattr_out_of_line_value(i,self.entry(reference),table)
+    def test_simple_binary_value_and_entry_are_unchanged(self):
+        payload=b'\x00\xffvalue\x80'; d,i=self.target_image(struct.pack('<I',len(payload))+payload); self.addCleanup(d.cleanup)
+        table=read_xattr_id_table(i); entry=self.entry(); before=entry
+        self.assertEqual(read_xattr_out_of_line_value(i,entry,table),payload)
+        self.assertEqual(entry,before); self.assertIsNone(entry.value); self.assertEqual(entry.out_of_line_reference,0)
+    def test_none_table_loads_and_supplied_table_is_reused(self):
+        d,i=self.target_image(struct.pack('<I',1)+b'Z'); self.addCleanup(d.cleanup); table=read_xattr_id_table(i)
+        with patch('squashfs.read_xattr_id_table',wraps=read_xattr_id_table) as reads:
+            self.assertEqual(read_xattr_out_of_line_value(i,self.entry(),table),b'Z'); self.assertEqual(reads.call_count,0)
+            self.assertEqual(read_xattr_out_of_line_value(i,self.entry()),b'Z'); self.assertEqual(reads.call_count,1)
+    def test_reference_decoder_linux_bit_layout_and_invalid_inputs(self):
+        for value,block,offset in ((0,0,0),(0x120000,0x12,0),(0x45,0,0x45),(0x120045,0x12,0x45),(0xffffffffffffffff,0xffffffffffff,0xffff)):
+            decoded=decode_xattr_reference(value); self.assertEqual((decoded.block,decoded.offset),(block,offset))
+        for value in (-1,0x10000000000000000,True):
+            with self.assertRaises(TypeError): decode_xattr_reference(value)
+    def test_entry_validation_is_typed_and_direct(self):
+        d,i=self.target_image(struct.pack('<I',0)); self.addCleanup(d.cleanup)
+        for entry,message in ((object(),'invalid type'),(SquashFSXAttrEntry(0,decode_xattr_namespace(0),b'n',b'user.n',b'x',1,False,None),'not out-of-line'),(SquashFSXAttrEntry(0x100,decode_xattr_namespace(0),b'n',b'user.n',None,8,True,None),'missing')):
+            with self.assertRaisesRegex(SquashFSXAttrValueError,message) as caught: read_xattr_out_of_line_value(i,entry)
+            self.assertIsNone(caught.exception.__cause__)
+    def test_table_validation_is_typed(self):
+        d,i=self.target_image(struct.pack('<I',0)); self.addCleanup(d.cleanup); good=read_xattr_id_table(i)
+        cases=(object(),SquashFSXAttrIDTable(good.table_start,good.xattr_table_start,1,(),0),SquashFSXAttrIDTable(good.table_start,-1,1,good.metadata_block_offsets,0),SquashFSXAttrIDTable(good.table_start,good.metadata_block_offsets[0],1,good.metadata_block_offsets,0),SquashFSXAttrIDTable(good.table_start,good.xattr_table_start,1,(good.table_start+1,),0),SquashFSXAttrIDTable(i.read_superblock().bytes_used+1,good.xattr_table_start,1,good.metadata_block_offsets,0))
+        for table in cases:
+            with self.assertRaises(SquashFSXAttrValueError): read_xattr_out_of_line_value(i,self.entry(),table)
+        self.patch(i,40,struct.pack('<Q',i.image.stat().st_size+1))
+        with self.assertRaises(SquashFSXAttrValueError): read_xattr_out_of_line_value(i,self.entry(),good)
+    def test_reference_bounds_and_invalid_reference_are_typed(self):
+        d,i=self.target_image(struct.pack('<I',0)); self.addCleanup(d.cleanup); table=read_xattr_id_table(i); upper=table.metadata_block_offsets[0]-table.xattr_table_start
+        for reference in (upper << 16,(upper+1)<<16,0xffffffffffffffff,8192,9000,-1,0x10000000000000000,True):
+            with self.assertRaises(SquashFSXAttrValueError): read_xattr_out_of_line_value(i,self.entry(reference),table)
+    def test_offset_8191_reaches_typed_header_failure(self):
+        d,i=self.target_image(struct.pack('<I',0)); self.addCleanup(d.cleanup)
+        with self.assertRaises(SquashFSXAttrValueError): read_xattr_out_of_line_value(i,self.entry(8191))
+    def test_each_short_target_header_is_wrapped_with_cause(self):
+        for count in range(4):
+            d,i=self.target_image(b'\0'*count); self.addCleanup(d.cleanup)
+            with self.assertRaisesRegex(SquashFSXAttrValueError,'header') as caught: read_xattr_out_of_line_value(i,self.entry())
+            self.assertIsNotNone(caught.exception.__cause__)
+    def test_zero_length_and_exact_fit_values(self):
+        i,value=self.resolve(struct.pack('<I',0)); self.assertEqual(value,b'')
+        i,value=self.resolve(struct.pack('<I',3)+b'\x01\0\xff'); self.assertEqual(value,b'\x01\0\xff')
+    def test_impossible_and_huge_declared_sizes_are_typed(self):
+        for size in (4,0xffffffff):
+            d,i=self.target_image(struct.pack('<I',size)+b'abc'); self.addCleanup(d.cleanup)
+            with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,self.entry())
+            self.assertNotIsInstance(caught.exception,MemoryError)
+    def test_metadata_failure_and_invalid_offset_preserve_cause(self):
+        d,i=self.target_image(struct.pack('<I',4)+b'abc'); self.addCleanup(d.cleanup)
+        with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,self.entry())
+        self.assertIsNotNone(caught.exception.__cause__)
+        d,i=self.target_image(struct.pack('<I',0)); self.addCleanup(d.cleanup)
+        with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,self.entry(100))
+        self.assertIsNone(caught.exception.__cause__)
+    def test_stage19_ool_entries_remain_lazy_after_resolution(self):
+        d,i=self.list_image(((0x100,b'n',struct.pack('<Q',0)),)); self.addCleanup(d.cleanup)
+        entry=read_xattr_list(i,read_xattr_id(i,0)).entries[0]
+        self.assertEqual((entry.out_of_line,entry.value,entry.out_of_line_reference),(True,None,0))
+        inode=self.extended_inode(0); self.assertIsNone(read_inode_xattrs(i,inode).entries[0].value)
+
+class SquashFSXAttrOutOfLineValueStage20C2Test(_XAttrFixture):
+    """Physical multi-block metadata fixtures for Stage 20C2."""
+    def metadata_image(self, blocks, reference_block=0, reference_offset=0):
+        d=tempfile.TemporaryDirectory(); p=Path(d.name)/'ool-boundary.sqfs'; xstart=128; cursor=xstart; encoded=[]; starts=[]
+        for data,compressed in blocks:
+            stored=zstandard.ZstdCompressor().compress(data) if compressed else data
+            encoded.append(struct.pack('<H',len(stored) if compressed else METADATA_UNCOMPRESSED_BIT|len(stored))+stored); starts.append(cursor); cursor+=len(encoded[-1])
+        idmeta=cursor+16; table=idmeta+18; end=table+24; raw=bytearray(end)
+        raw[:96]=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,end,0,table,0,0,0,0)
+        for start,data in zip(starts,encoded): raw[start:start+len(data)]=data
+        raw[idmeta:idmeta+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|16); raw[idmeta+2:idmeta+18]=XATTR_ID_STRUCT.pack(0,1,0); raw[table:table+16]=struct.pack('<QII',xstart,1,0); raw[table+16:table+24]=struct.pack('<Q',idmeta); p.write_bytes(raw)
+        reference=(starts[reference_block]-xstart)<<16|reference_offset
+        return d,SquashFSImage(p),reference
+    def resolve_blocks(self, blocks, **kwargs):
+        d,i,reference=self.metadata_image(blocks,**kwargs); self.addCleanup(d.cleanup); entry=SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference)
+        return read_xattr_out_of_line_value(i,entry),entry
+    def test_vsize_boundary_matrix(self):
+        payload=b'\x00\xffP'; target=struct.pack('<I',len(payload))+payload
+        for split in (0,1,2,3,4):
+            first=b'x'*(8192-split)+target[:split]; second=target[split:]
+            value,entry=self.resolve_blocks(((first,False),(second,False)),reference_block=1 if split == 0 else 0,reference_offset=0 if split == 0 else 8192-split)
+            self.assertEqual(value,payload); self.assertIsNone(entry.value)
+    def test_payload_boundary_and_multi_block_matrix(self):
+        payload=bytes(range(256))*65; header=struct.pack('<I',len(payload)); first=b'x'*(8192-4)+header; second=payload[:8192]; third=payload[8192:16384]; fourth=payload[16384:]
+        value,_=self.resolve_blocks(((first,False),(second,False),(third,False),(fourth,False)),reference_offset=8188)
+        self.assertEqual(value,payload)
+    def test_header_exact_boundary_and_payload_start_boundary(self):
+        payload=b'\x01\0\xff'; first=b'x'*8188+struct.pack('<I',len(payload)); value,_=self.resolve_blocks(((first,False),(payload,False)),reference_offset=8188)
+        self.assertEqual(value,payload)
+    def test_compressed_and_mixed_metadata_combinations(self):
+        payload=bytes(range(64))*3; target=struct.pack('<I',len(payload))+payload
+        for flags in ((True,),(True,False),(False,True),(True,True)):
+            if len(flags)==1: blocks=((target,flags[0]),)
+            else: blocks=((target[:4],flags[0]),(target[4:],flags[1]))
+            value,_=self.resolve_blocks(blocks); self.assertEqual(value,payload)
+    def test_payload_crosses_multiple_compressed_blocks_and_exact_region_end(self):
+        payload=bytes(range(256))*36; header=struct.pack('<I',len(payload)); first=b'x'*8189+header[:3]; second=header[3:]+payload[:8191]; third=payload[8191:]
+        value,_=self.resolve_blocks(((first,True),(second,True),(third,True)),reference_offset=8189)
+        self.assertEqual(value,payload)
+        value,_=self.resolve_blocks(((struct.pack('<I',3)+b'xyz',False),)); self.assertEqual(value,b'xyz')
+    def test_offsets_8190_8191_8192_and_upper_bound(self):
+        for offset in (8190,8191):
+            header=struct.pack('<I',0); first=b'x'*offset+header[:8192-offset]; second=header[8192-offset:]
+            value,_=self.resolve_blocks(((first,False),(second,False)),reference_offset=offset); self.assertEqual(value,b'')
+        d,i,reference=self.metadata_image(((b'x'*8192,False),(struct.pack('<I',0),False)),reference_offset=8192); self.addCleanup(d.cleanup)
+        with self.assertRaises(SquashFSXAttrValueError): read_xattr_out_of_line_value(i,SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference))
+    def test_missing_and_corrupt_continuations_are_wrapped(self):
+        first=b'x'*8191+struct.pack('<I',1)[:1]
+        d,i,reference=self.metadata_image(((first,False),),reference_offset=8191); self.addCleanup(d.cleanup)
+        with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference))
+        self.assertIsNotNone(caught.exception.__cause__)
+    def test_truncated_continuation_variants_and_upper_bound_overrun(self):
+        first=b'x'*8191+struct.pack('<I',1)[:1]; second=b'\0\0\0Z'
+        for truncate_at in (0,1,2):
+            d,i,reference=self.metadata_image(((first,False),(second,False)),reference_offset=8191); self.addCleanup(d.cleanup)
+            next_offset=128+2+len(first)
+            with i.image.open('r+b') as source: source.truncate(next_offset+truncate_at)
+            with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference))
+            self.assertIsNotNone(caught.exception.__cause__)
+        d,i,reference=self.metadata_image(((struct.pack('<I',4)+b'abc',False),),reference_offset=0); self.addCleanup(d.cleanup)
+        with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference))
+        self.assertIsNotNone(caught.exception.__cause__)
+    def test_compressed_length_and_decoded_size_failures_are_wrapped(self):
+        d,i,reference=self.metadata_image(((struct.pack('<I',0),True),),reference_offset=0); self.addCleanup(d.cleanup)
+        with i.image.open('r+b') as source: source.seek(128); source.write(b'\xff\x7f')
+        with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference))
+        self.assertIsNotNone(caught.exception.__cause__)
+        huge=zstandard.ZstdCompressor().compress(b'x'*(METADATA_SIZE+1)); d,i,reference=self.metadata_image(((b'x',False),),reference_offset=0); self.addCleanup(d.cleanup)
+        with i.image.open('r+b') as source: source.seek(128); source.write(struct.pack('<H',len(huge))+huge)
+        with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference))
+        self.assertIsNotNone(caught.exception.__cause__)
+        d,i,reference=self.metadata_image(((b'not-zstd',True),),reference_offset=0); self.addCleanup(d.cleanup)
+        with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference))
+        self.assertIsNotNone(caught.exception.__cause__)
+    def test_duplicate_references_are_independent(self):
+        payload=b'\0\x80duplicate\xff'; d,i,reference=self.metadata_image(((struct.pack('<I',len(payload))+payload,False),)); self.addCleanup(d.cleanup)
+        first=SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference); second=SquashFSXAttrOutOfLineValueStage20C1Test.entry(reference)
+        self.assertEqual((read_xattr_out_of_line_value(i,first),read_xattr_out_of_line_value(i,second)),(payload,payload)); self.assertIsNone(first.value); self.assertIsNone(second.value)
+
+class SquashFSXAttrOutOfLineValueStage20C3Test(_XAttrFixture):
+    """End-to-end Stage 18/19/20 physical XAttr integration fixtures."""
+    def integration_image(self):
+        d=tempfile.TemporaryDirectory(); p=Path(d.name)/'ool-integration.sqfs'; xstart=128; idmeta=4096; table=5000
+        first=b'\0\xffone'; second=b'two\x80\0'; targets=struct.pack('<I',len(first))+first; second_offset=len(targets); targets+=struct.pack('<I',len(second))+second
+        def record(typ,name,value): return struct.pack('<HH',typ,len(name))+name+struct.pack('<I',len(value))+value
+        list0=record(0,b'inline',b'I\0')+record(0x101,b'trusted',struct.pack('<Q',0))+record(0x102,b'security',struct.pack('<Q',second_offset))+record(0x107,b'unknown',struct.pack('<Q',0))
+        list0+=b'\0'*(-len(list0)%4); list1=record(0x100,b'again',struct.pack('<Q',0)); list1+=b'\0'*(-len(list1)%4)
+        off0=len(targets); off1=off0+len(list0); payload=targets+list0+list1; ids=XATTR_ID_STRUCT.pack(off0,4,len(list0))+XATTR_ID_STRUCT.pack(off1,1,len(list1)); end=table+24
+        raw=bytearray(end); raw[:96]=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,end,0,table,0,0,0,0)
+        raw[xstart:xstart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(payload)); raw[xstart+2:xstart+2+len(payload)]=payload; raw[idmeta:idmeta+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(ids)); raw[idmeta+2:idmeta+2+len(ids)]=ids
+        raw[table:table+16]=struct.pack('<QII',xstart,2,0); raw[table+16:table+24]=struct.pack('<Q',idmeta); p.write_bytes(raw); return d,SquashFSImage(p),(first,second)
+    def test_full_id_table_list_value_flow_and_immutability(self):
+        d,i,values=self.integration_image(); self.addCleanup(d.cleanup); table=read_xattr_id_table(i); ident=read_xattr_id(i,0,table); listing=read_xattr_list(i,ident,table); before=(listing,listing.entries[1])
+        self.assertEqual((ident.index,ident.count,listing.entries[1].out_of_line_reference),(0,4,0)); self.assertEqual(read_xattr_out_of_line_value(i,listing.entries[1],table),values[0]); self.assertEqual((listing,listing.entries[1]),before)
+    def test_none_table_mixed_namespaces_and_repeated_calls(self):
+        d,i,values=self.integration_image(); self.addCleanup(d.cleanup); listing=read_xattr_list(i,read_xattr_id(i,0),None)
+        self.assertEqual([entry.namespace.prefix for entry in listing.entries],[b'user.',b'trusted.',b'security.',None]); self.assertEqual(listing.entries[0].value,b'I\0')
+        self.assertEqual([read_xattr_out_of_line_value(i,listing.entries[n],None) for n in (1,2,3)], [values[0],values[1],values[0]])
+        self.assertEqual(read_xattr_out_of_line_value(i,listing.entries[1],None),values[0])
+    def test_inode_id_zero_nonzero_and_sentinel_remain_lazy(self):
+        d,i,values=self.integration_image(); self.addCleanup(d.cleanup)
+        self.assertIsNone(read_inode_xattrs(i,self.extended_inode(0xffffffff)))
+        zero=read_inode_xattrs(i,self.extended_inode(0)); one=read_inode_xattrs(i,self.extended_inode(1)); self.assertEqual((len(zero.entries),len(one.entries)),(4,1)); self.assertIsNone(zero.entries[1].value)
+        self.assertEqual(read_xattr_out_of_line_value(i,zero.entries[1]),values[0]); self.assertEqual(read_xattr_out_of_line_value(i,one.entries[0]),values[0])
+    def test_wrong_table_and_public_misuse_are_typed(self):
+        d,first,_=self.integration_image(); self.addCleanup(d.cleanup); table=read_xattr_id_table(first); listing=read_xattr_list(first,read_xattr_id(first,0),table)
+        d,second=self.xattr_image(); self.addCleanup(d.cleanup)
+        with self.assertRaises(SquashFSXAttrValueError): read_xattr_out_of_line_value(second,listing.entries[1],table)
+        with self.assertRaises(SquashFSXAttrInodeError): read_inode_xattrs(first,self.extended_inode(9))
+    def test_malformed_target_and_zero_reference_contract(self):
+        d,i,values=self.integration_image(); self.addCleanup(d.cleanup); entry=read_xattr_list(i,read_xattr_id(i,0)).entries[1]
+        self.assertEqual((entry.out_of_line_reference,read_xattr_out_of_line_value(i,entry)),(0,values[0]))
+        self.patch(i,128,b'\0\0')
+        with self.assertRaises(SquashFSXAttrValueError) as caught: read_xattr_out_of_line_value(i,entry)
+        self.assertIsNotNone(caught.exception.__cause__)
 
 class SquashFSXAttrListReaderTest(_XAttrFixture):
     def test_one_entry(self):
