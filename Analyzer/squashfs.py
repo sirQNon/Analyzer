@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
+from enum import IntEnum
+from types import MappingProxyType
 from pathlib import Path
 
 import zstandard
@@ -66,6 +68,21 @@ INODE_LOOKUP_ENTRY_SIZE = INODE_LOOKUP_ENTRY_STRUCT.size
 XATTR_ID_TABLE_STRUCT = struct.Struct("<QII")
 XATTR_ID_STRUCT = struct.Struct("<QII")
 XATTR_ID_SIZE = XATTR_ID_STRUCT.size
+VFS_CAP_REVISION_MASK = 0xFF000000
+VFS_CAP_REVISION_1 = 0x01000000
+VFS_CAP_REVISION_2 = 0x02000000
+VFS_CAP_REVISION_3 = 0x03000000
+VFS_CAP_FLAGS_MASK = 0x00FFFFFF
+VFS_CAP_FLAGS_EFFECTIVE = 0x000001
+VFS_CAP_U32_1 = 1
+VFS_CAP_U32_2 = 2
+XATTR_CAPS_SZ_1 = 12
+XATTR_CAPS_SZ_2 = 20
+XATTR_CAPS_SZ_3 = 24
+LINUX_CAP_LAST_KNOWN = 40
+LINUX_CAPABILITY_NAMES = MappingProxyType(dict(enumerate((
+    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP", "CAP_LINUX_IMMUTABLE", "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK", "CAP_IPC_OWNER", "CAP_SYS_MODULE", "CAP_SYS_RAWIO", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE", "CAP_SYS_PACCT", "CAP_SYS_ADMIN", "CAP_SYS_BOOT", "CAP_SYS_NICE", "CAP_SYS_RESOURCE", "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_MKNOD", "CAP_LEASE", "CAP_AUDIT_WRITE", "CAP_AUDIT_CONTROL", "CAP_SETFCAP", "CAP_MAC_OVERRIDE", "CAP_MAC_ADMIN", "CAP_SYSLOG", "CAP_WAKE_ALARM", "CAP_BLOCK_SUSPEND", "CAP_AUDIT_READ", "CAP_PERFMON", "CAP_BPF", "CAP_CHECKPOINT_RESTORE",
+))))
 
 
 @dataclass(frozen=True)
@@ -102,6 +119,41 @@ class SquashFSMetadataBlock:
     is_compressed: bool
     data: bytes
     next_offset: int
+
+
+class LinuxCapabilityRevision(IntEnum):
+    REVISION_1 = VFS_CAP_REVISION_1
+    REVISION_2 = VFS_CAP_REVISION_2
+    REVISION_3 = VFS_CAP_REVISION_3
+
+
+@dataclass(frozen=True)
+class LinuxCapabilitySet:
+    raw_mask: int
+    capability_numbers: tuple[int, ...]
+    known_names: tuple[str, ...]
+    unknown_numbers: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.raw_mask < 0:
+            raise ValueError("Capability mask must not be negative")
+        expected_numbers = tuple(bit for bit in range(max(1, self.raw_mask.bit_length())) if self.raw_mask & (1 << bit))
+        expected_names = tuple(LINUX_CAPABILITY_NAMES[number] for number in expected_numbers if number in LINUX_CAPABILITY_NAMES)
+        expected_unknown = tuple(number for number in expected_numbers if number not in LINUX_CAPABILITY_NAMES)
+        if (self.capability_numbers, self.known_names, self.unknown_numbers) != (expected_numbers, expected_names, expected_unknown):
+            raise ValueError("Capability numbers must be unique non-negative ascending tuple")
+
+
+@dataclass(frozen=True)
+class LinuxFileCapabilities:
+    revision: LinuxCapabilityRevision
+    effective: bool
+    permitted: LinuxCapabilitySet
+    inheritable: LinuxCapabilitySet
+    root_id: int | None
+    raw_magic_etc: int
+    raw_flags: int
+    raw_value: bytes
 
 
 @dataclass(frozen=True)
@@ -352,6 +404,70 @@ class SquashFSDirectoryRecord:
 
 class SquashFSMetadataError(ValueError):
     """Invalid or unreadable SquashFS metadata block."""
+
+
+class LinuxCapabilityError(ValueError):
+    """Invalid raw Linux security.capability value."""
+
+
+class LinuxCapabilityTypeError(LinuxCapabilityError): pass
+class LinuxCapabilitySizeError(LinuxCapabilityError): pass
+class LinuxCapabilityRevisionError(LinuxCapabilityError): pass
+class LinuxCapabilityFlagsError(LinuxCapabilityError): pass
+
+
+def _linux_capability_set(raw_mask: int, word_count: int) -> LinuxCapabilitySet:
+    numbers = tuple(bit for bit in range(word_count * 32) if raw_mask & (1 << bit))
+    return LinuxCapabilitySet(
+        raw_mask,
+        numbers,
+        tuple(LINUX_CAPABILITY_NAMES[bit] for bit in numbers if bit in LINUX_CAPABILITY_NAMES),
+        tuple(bit for bit in numbers if bit not in LINUX_CAPABILITY_NAMES),
+    )
+
+
+def decode_linux_file_capabilities(value) -> LinuxFileCapabilities:
+    """Decode an opaque Linux security.capability XAttr without host state."""
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise LinuxCapabilityTypeError("Capability value must be bytes-like")
+    raw_value = bytes(value)
+    if len(raw_value) < 4:
+        raise LinuxCapabilitySizeError("Capability value is shorter than magic_etc")
+    try:
+        magic_etc = struct.unpack_from("<I", raw_value)[0]
+    except struct.error as error:
+        raise LinuxCapabilitySizeError("Cannot decode capability magic_etc") from error
+    revision_raw = magic_etc & VFS_CAP_REVISION_MASK
+    try:
+        revision = LinuxCapabilityRevision(revision_raw)
+    except ValueError as error:
+        raise LinuxCapabilityRevisionError(
+            f"Unknown capability revision: {revision_raw:#x}"
+        ) from error
+    expected_size, words = {
+        LinuxCapabilityRevision.REVISION_1: (XATTR_CAPS_SZ_1, VFS_CAP_U32_1),
+        LinuxCapabilityRevision.REVISION_2: (XATTR_CAPS_SZ_2, VFS_CAP_U32_2),
+        LinuxCapabilityRevision.REVISION_3: (XATTR_CAPS_SZ_3, VFS_CAP_U32_2),
+    }[revision]
+    if len(raw_value) != expected_size:
+        raise LinuxCapabilitySizeError(
+            f"Capability revision {revision.name} requires {expected_size} bytes"
+        )
+    flags = magic_etc & VFS_CAP_FLAGS_MASK
+    if flags & ~VFS_CAP_FLAGS_EFFECTIVE:
+        raise LinuxCapabilityFlagsError(f"Unknown capability flags: {flags:#x}")
+    try:
+        values = struct.unpack("<" + "I" * (len(raw_value) // 4), raw_value)
+    except struct.error as error:
+        raise LinuxCapabilitySizeError("Cannot decode capability value") from error
+    permitted = values[1] | ((values[3] << 32) if words == 2 else 0)
+    inheritable = values[2] | ((values[4] << 32) if words == 2 else 0)
+    return LinuxFileCapabilities(
+        revision, bool(flags & VFS_CAP_FLAGS_EFFECTIVE),
+        _linux_capability_set(permitted, words), _linux_capability_set(inheritable, words),
+        values[5] if revision is LinuxCapabilityRevision.REVISION_3 else None,
+        magic_etc, flags, raw_value,
+    )
 
 
 class SquashFSMetadataStreamError(ValueError):

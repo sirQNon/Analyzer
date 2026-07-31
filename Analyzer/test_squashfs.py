@@ -7,6 +7,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 import zstandard
+import squashfs
 
 from squashfs import (
     BASIC_DIRECTORY_INODE_BODY_STRUCT,
@@ -120,12 +121,113 @@ from squashfs import (
     read_basic_symlink,
     read_directory,
     read_inode,
+    decode_linux_file_capabilities, LinuxCapabilityRevision, LinuxCapabilityError,
+    LinuxCapabilityTypeError, LinuxCapabilitySizeError, LinuxCapabilityRevisionError,
+    LinuxCapabilityFlagsError, VFS_CAP_REVISION_1, VFS_CAP_REVISION_2,
+    VFS_CAP_REVISION_3, VFS_CAP_FLAGS_EFFECTIVE,
+    VFS_CAP_REVISION_MASK, VFS_CAP_FLAGS_MASK, XATTR_CAPS_SZ_1,
+    XATTR_CAPS_SZ_2, XATTR_CAPS_SZ_3, LinuxCapabilitySet,
+    VFS_CAP_U32_1, VFS_CAP_U32_2,
+    LINUX_CAPABILITY_NAMES, LINUX_CAP_LAST_KNOWN,
 )
 
 
 ROOT = Path(__file__).resolve().parent.parent
 ROOTFS = ROOT / "Extracted" / "rootfs"
 
+class LinuxFileCapabilitiesStage21BTest(unittest.TestCase):
+    def decode(self, revision, words=(0,0,0,0), root=None, flags=0):
+        values=[revision|flags,*words[:2]]
+        if revision != VFS_CAP_REVISION_1: values.extend(words[2:4])
+        if revision == VFS_CAP_REVISION_3: values.append(root if root is not None else 0)
+        return decode_linux_file_capabilities(struct.pack('<'+'I'*len(values),*values))
+    def test_revisions_masks_and_sets(self):
+        one=self.decode(VFS_CAP_REVISION_1,(3,4)); self.assertEqual((one.revision,one.permitted.capability_numbers,one.inheritable.capability_numbers),(LinuxCapabilityRevision.REVISION_1,(0,1),(2,)))
+        two=self.decode(VFS_CAP_REVISION_2,(1,0,0,0x80000000),flags=VFS_CAP_FLAGS_EFFECTIVE); self.assertEqual((two.effective,two.inheritable.capability_numbers),(True,(63,)))
+    def test_revision3_rootids_and_rootfs_fixture(self):
+        self.assertEqual(self.decode(VFS_CAP_REVISION_3,root=0xffffffff).root_id,0xffffffff)
+        value=decode_linux_file_capabilities(bytes.fromhex('0100000200200000000000000000000000000000')); self.assertEqual((value.revision,value.effective,value.permitted.raw_mask,value.permitted.capability_numbers,value.root_id),(LinuxCapabilityRevision.REVISION_2,True,0x2000,(13,),None))
+    def test_bytes_like_is_copied_and_models_frozen(self):
+        raw=bytearray(struct.pack('<III',VFS_CAP_REVISION_1,1,0)); value=decode_linux_file_capabilities(memoryview(raw)); raw[4]=0
+        self.assertEqual(value.permitted.raw_mask,1)
+        with self.assertRaises(AttributeError): value.raw_flags=0
+        with self.assertRaises(AttributeError): value.permitted.raw_mask=0
+    def test_errors_are_typed(self):
+        for raw,error in (('x',LinuxCapabilityTypeError),(b'',LinuxCapabilitySizeError),(b'\0',LinuxCapabilitySizeError),(struct.pack('<I',0x99000000),LinuxCapabilityRevisionError),(struct.pack('<III',VFS_CAP_REVISION_1|2,0,0),LinuxCapabilityFlagsError),(struct.pack('<IIIII',VFS_CAP_REVISION_1,0,0,0,0),LinuxCapabilitySizeError)):
+            with self.assertRaises(error) as caught: decode_linux_file_capabilities(raw)
+            self.assertIsInstance(caught.exception,LinuxCapabilityError)
+    def test_repeated_results_and_independent_sets(self):
+        raw=struct.pack('<IIIII',VFS_CAP_REVISION_2,5,0,0,0); self.assertEqual(decode_linux_file_capabilities(raw),decode_linux_file_capabilities(raw))
+    def test_constants_sizes_and_all_exact_size_mismatches(self):
+        self.assertEqual((VFS_CAP_REVISION_MASK,VFS_CAP_FLAGS_MASK,XATTR_CAPS_SZ_1,XATTR_CAPS_SZ_2,XATTR_CAPS_SZ_3),(0xff000000,0x00ffffff,12,20,24))
+        for revision,size in ((VFS_CAP_REVISION_1,20),(VFS_CAP_REVISION_2,12),(VFS_CAP_REVISION_3,20)):
+            with self.assertRaises(LinuxCapabilitySizeError): decode_linux_file_capabilities(struct.pack('<I',revision)+b'\0'*(size-4))
+    def test_flags_masks_and_direct_model_invariants(self):
+        with self.assertRaises(LinuxCapabilityFlagsError): decode_linux_file_capabilities(struct.pack('<III',VFS_CAP_REVISION_1|VFS_CAP_FLAGS_EFFECTIVE|2,0,0))
+        with self.assertRaises(ValueError): LinuxCapabilitySet(-1,(),(),())
+        with self.assertRaises(ValueError): LinuxCapabilitySet(3,(1,0,1),(),())
+    def test_every_structural_constant_has_linux_value(self):
+        self.assertEqual((VFS_CAP_REVISION_MASK,VFS_CAP_REVISION_1,VFS_CAP_REVISION_2,VFS_CAP_REVISION_3),(0xff000000,0x01000000,0x02000000,0x03000000))
+        self.assertEqual((VFS_CAP_FLAGS_MASK,VFS_CAP_FLAGS_EFFECTIVE,VFS_CAP_U32_1,VFS_CAP_U32_2),(0x00ffffff,1,1,2))
+        self.assertEqual((XATTR_CAPS_SZ_1,XATTR_CAPS_SZ_2,XATTR_CAPS_SZ_3),(12,20,24))
+    def test_zero_sets_effective_clear_and_raw_fields(self):
+        for revision in (VFS_CAP_REVISION_1,VFS_CAP_REVISION_2,VFS_CAP_REVISION_3):
+            value=self.decode(revision,root=0); self.assertFalse(value.effective); self.assertEqual((value.permitted.raw_mask,value.inheritable.raw_mask),(0,0)); self.assertEqual(value.root_id,0 if revision==VFS_CAP_REVISION_3 else None)
+            self.assertEqual((value.raw_magic_etc,value.raw_flags,value.raw_value,type(value.raw_value)),(revision,0,bytes(value.raw_value),bytes))
+    def test_revision2_independence_and_revision_ranges(self):
+        value=self.decode(VFS_CAP_REVISION_2,(0,2,0x80000000,0)); self.assertEqual((value.permitted.capability_numbers,value.inheritable.capability_numbers),((63,),(1,)))
+        self.assertTrue(all(bit <= 31 for bit in self.decode(VFS_CAP_REVISION_1,(0xffffffff,0xffffffff)).permitted.capability_numbers))
+        self.assertEqual(self.decode(VFS_CAP_REVISION_3,(0,0,0x80000000,0)).permitted.capability_numbers,(63,))
+    def test_bytearray_and_all_short_lengths(self):
+        raw=bytearray(struct.pack('<III',VFS_CAP_REVISION_1,1,0)); value=decode_linux_file_capabilities(raw); raw[4]=0
+        self.assertEqual((value.raw_value,value.permitted.raw_mask),(struct.pack('<III',VFS_CAP_REVISION_1,1,0),1))
+        for raw in (b'\0',b'\0\0',b'\0\0\0'):
+            with self.assertRaises(LinuxCapabilitySizeError): decode_linux_file_capabilities(raw)
+        with self.assertRaises(LinuxCapabilityTypeError): decode_linux_file_capabilities(object())
+    def test_trailing_data_and_controlled_unpack_cause(self):
+        for revision in (VFS_CAP_REVISION_1,VFS_CAP_REVISION_2,VFS_CAP_REVISION_3):
+            raw=self.decode(revision).raw_value+b'x'
+            with self.assertRaises(LinuxCapabilitySizeError): decode_linux_file_capabilities(raw)
+        valid=struct.pack('<IIIII',VFS_CAP_REVISION_2,0,0,0,0)
+        with patch.object(squashfs.struct,'unpack',side_effect=struct.error('forced')):
+            with self.assertRaises(LinuxCapabilitySizeError) as caught: decode_linux_file_capabilities(valid)
+        self.assertIsInstance(caught.exception.__cause__,struct.error)
+
+
+class LinuxCapabilityNamesStage21C1Test(unittest.TestCase):
+    def test_mapping_is_complete_immutable_and_exact(self):
+        self.assertEqual(tuple(LINUX_CAPABILITY_NAMES),tuple(range(LINUX_CAP_LAST_KNOWN+1))); self.assertEqual((LINUX_CAPABILITY_NAMES[0],LINUX_CAPABILITY_NAMES[13],LINUX_CAPABILITY_NAMES[40]),('CAP_CHOWN','CAP_NET_RAW','CAP_CHECKPOINT_RESTORE'))
+        self.assertEqual(len(set(LINUX_CAPABILITY_NAMES.values())),len(LINUX_CAPABILITY_NAMES))
+        with self.assertRaises(TypeError): LINUX_CAPABILITY_NAMES[0]='x'
+    def test_known_unknown_and_rootfs_classification(self):
+        value=decode_linux_file_capabilities(bytes.fromhex('0100000200200000000000000000000000000000')); self.assertEqual((value.permitted.known_names,value.permitted.unknown_numbers),(('CAP_NET_RAW',),()))
+        future=decode_linux_file_capabilities(struct.pack('<IIIII',VFS_CAP_REVISION_2,0,0,1<<9,0)); self.assertEqual((future.permitted.known_names,future.permitted.unknown_numbers), ((),(41,)))
+    def test_direct_invariants_and_repeated_results(self):
+        with self.assertRaises(ValueError): LinuxCapabilitySet(1,(0,),(),())
+        with self.assertRaises(ValueError): LinuxCapabilitySet(1,(0,),('CAP_NET_RAW',),())
+        raw=struct.pack('<IIIII',VFS_CAP_REVISION_2,1,0,0,0); self.assertEqual(decode_linux_file_capabilities(raw),decode_linux_file_capabilities(raw))
+    def test_direct_zero_and_mixed_invariants(self):
+        self.assertEqual(LinuxCapabilitySet(0,(),(),()),LinuxCapabilitySet(0,(),(),()))
+        self.assertEqual(LinuxCapabilitySet((1<<0)|(1<<41),(0,41),('CAP_CHOWN',),(41,)).unknown_numbers,(41,))
+        for args in ((1,(0,),(),()),((1<<41),(41),(),()),(1,(0,),('CAP_CHOWN',),(41,))):
+            with self.assertRaises(ValueError): LinuxCapabilitySet(*args)
+    def test_zero_mixed_ordering_and_revision_classification(self):
+        zero=decode_linux_file_capabilities(struct.pack('<IIIII',VFS_CAP_REVISION_2,0,0,0,0)); self.assertEqual((zero.permitted.capability_numbers,zero.permitted.known_names,zero.permitted.unknown_numbers), ((),(),()))
+        mixed=decode_linux_file_capabilities(struct.pack('<IIIII',VFS_CAP_REVISION_2,(1<<0)|(1<<13),0,1<<9,0)); self.assertEqual((mixed.permitted.capability_numbers,mixed.permitted.known_names,mixed.permitted.unknown_numbers),((0,13,41),('CAP_CHOWN','CAP_NET_RAW'),(41,)))
+
+class LinuxFileCapabilitiesRootFSStage21DTest(unittest.TestCase):
+    RAW=bytes.fromhex('0100000200200000000000000000000000000000')
+    def assert_fixture(self, raw):
+        value=decode_linux_file_capabilities(raw)
+        self.assertEqual((value.revision,value.effective,value.raw_magic_etc,value.raw_flags),(LinuxCapabilityRevision.REVISION_2,True,0x02000001,1))
+        self.assertEqual((value.permitted.raw_mask,value.permitted.capability_numbers,value.permitted.known_names,value.permitted.unknown_numbers),(0x2000,(13,),('CAP_NET_RAW',),()))
+        self.assertEqual((value.inheritable.raw_mask,value.inheritable.capability_numbers,value.root_id,value.raw_value),(0,(),None,raw))
+        self.assertEqual(value,decode_linux_file_capabilities(raw))
+    def test_embedded_rootfs_regression_fixture(self): self.assert_fixture(self.RAW)
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_live_rootfs_capability_value_matches_observation(self):
+        image=SquashFSImage(ROOTFS); table=read_xattr_id_table(image); listing=read_xattr_list(image,read_xattr_id(image,0,table),table); entry=next(item for item in listing.entries if item.full_name==b'security.capability')
+        self.assertFalse(entry.out_of_line); self.assertEqual(entry.value,self.RAW); self.assert_fixture(entry.value)
 
 class SquashFSSuperBlockTest(unittest.TestCase):
     def test_rootfs_superblock_matches_investigation(self):
