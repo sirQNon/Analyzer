@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
 from types import MappingProxyType
 from pathlib import Path
 
@@ -221,6 +221,86 @@ class SquashFSXAttrEntry:
     value_size: int
     out_of_line: bool
     out_of_line_reference: int | None
+
+
+class XAttrSemanticKind(Enum):
+    UNKNOWN = "unknown"
+    LINUX_FILE_CAPABILITIES = "linux_file_capabilities"
+
+
+class XAttrSemanticError(ValueError):
+    """An XAttr cannot be dispatched to a semantic decoder."""
+
+
+class XAttrSemanticTypeError(XAttrSemanticError):
+    """A semantic-dispatch API argument has an invalid type."""
+
+
+class XAttrSemanticDecoderError(XAttrSemanticError):
+    """A registered semantic decoder rejected an otherwise valid value."""
+
+
+class XAttrSemanticValueResolutionError(XAttrSemanticError):
+    """An XAttr value cannot be obtained through the transport layer."""
+
+
+@dataclass(frozen=True)
+class UnknownXAttrSemanticValue:
+    full_name: bytes | None
+    raw_value: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.full_name, (bytes, type(None))):
+            raise ValueError("Unknown xattr full name must be bytes or None")
+        if not isinstance(self.raw_value, bytes):
+            raise ValueError("Unknown xattr raw value must be bytes")
+
+
+@dataclass(frozen=True)
+class XAttrSemanticDecoder:
+    decoder_id: str
+    kind: XAttrSemanticKind
+    decode: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decoder_id, str) or not self.decoder_id:
+            raise ValueError("Xattr semantic decoder ID must be non-empty text")
+        if not isinstance(self.kind, XAttrSemanticKind) or self.kind is XAttrSemanticKind.UNKNOWN:
+            raise ValueError("Xattr semantic decoder kind must be known")
+        if not callable(self.decode):
+            raise ValueError("Xattr semantic decoder must be callable")
+
+
+@dataclass(frozen=True)
+class DecodedXAttr:
+    entry: SquashFSXAttrEntry
+    raw_value: bytes
+    kind: XAttrSemanticKind
+    decoder_id: str | None
+    known: bool
+    semantic_value: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entry, SquashFSXAttrEntry):
+            raise ValueError("Decoded xattr entry must be a SquashFSXAttrEntry")
+        if not isinstance(self.raw_value, bytes):
+            raise ValueError("Decoded xattr raw value must be bytes")
+        if not isinstance(self.kind, XAttrSemanticKind):
+            raise ValueError("Decoded xattr kind is invalid")
+        if not isinstance(self.known, bool):
+            raise ValueError("Decoded xattr known flag must be bool")
+        if self.known:
+            if self.kind is XAttrSemanticKind.UNKNOWN or not isinstance(self.decoder_id, str) or not self.decoder_id:
+                raise ValueError("Known decoded xattr requires a known kind and decoder ID")
+            if isinstance(self.semantic_value, UnknownXAttrSemanticValue):
+                raise ValueError("Known decoded xattr cannot contain an unknown value")
+        else:
+            if self.kind is not XAttrSemanticKind.UNKNOWN or self.decoder_id is not None:
+                raise ValueError("Unknown decoded xattr must have unknown kind and no decoder ID")
+            if not isinstance(self.semantic_value, UnknownXAttrSemanticValue):
+                raise ValueError("Unknown decoded xattr requires an unknown value")
+            if (self.semantic_value.full_name, self.semantic_value.raw_value) != (self.entry.full_name, self.raw_value):
+                raise ValueError("Unknown decoded xattr provenance does not match its entry")
 
 
 @dataclass(frozen=True)
@@ -468,6 +548,81 @@ def decode_linux_file_capabilities(value) -> LinuxFileCapabilities:
         values[5] if revision is LinuxCapabilityRevision.REVISION_3 else None,
         magic_etc, flags, raw_value,
     )
+
+
+XATTR_SEMANTIC_DECODERS = MappingProxyType({
+    b"security.capability": XAttrSemanticDecoder(
+        "linux.security.capability",
+        XAttrSemanticKind.LINUX_FILE_CAPABILITIES,
+        decode_linux_file_capabilities,
+    ),
+})
+
+
+def decode_xattr_semantic(entry: SquashFSXAttrEntry, raw_value) -> DecodedXAttr:
+    """Dispatch one already-resolved XAttr value without image or host access."""
+    if not isinstance(entry, SquashFSXAttrEntry):
+        raise XAttrSemanticTypeError("Xattr semantic entry has an invalid type")
+    if not isinstance(raw_value, (bytes, bytearray, memoryview)):
+        raise XAttrSemanticTypeError("Xattr semantic raw value must be bytes-like")
+    if not isinstance(entry.full_name, (bytes, type(None))):
+        raise XAttrSemanticTypeError("Xattr semantic full name must be bytes or None")
+    raw_value = bytes(raw_value)
+    descriptor = XATTR_SEMANTIC_DECODERS.get(entry.full_name)
+    if descriptor is None:
+        unknown = UnknownXAttrSemanticValue(entry.full_name, raw_value)
+        return DecodedXAttr(
+            entry, raw_value, XAttrSemanticKind.UNKNOWN, None, False, unknown
+        )
+    try:
+        semantic_value = descriptor.decode(raw_value)
+    except LinuxCapabilityError as error:
+        raise XAttrSemanticDecoderError(
+            f"Cannot decode semantic xattr {descriptor.decoder_id}"
+        ) from error
+    return DecodedXAttr(
+        entry, raw_value, descriptor.kind, descriptor.decoder_id, True, semantic_value
+    )
+
+
+def read_and_decode_xattr(
+    image: SquashFSImage,
+    entry: SquashFSXAttrEntry,
+    table: SquashFSXAttrIDTable | None = None,
+) -> DecodedXAttr:
+    """Lazily acquire one XAttr value, then dispatch its semantic decoder."""
+    if not isinstance(image, SquashFSImage):
+        raise XAttrSemanticTypeError("Xattr semantic image has an invalid type")
+    if not isinstance(entry, SquashFSXAttrEntry):
+        raise XAttrSemanticTypeError("Xattr semantic entry has an invalid type")
+    if table is not None and not isinstance(table, SquashFSXAttrIDTable):
+        raise XAttrSemanticTypeError("Xattr semantic table has an invalid type")
+    if entry.out_of_line:
+        if entry.value is not None:
+            raise XAttrSemanticValueResolutionError(
+                "Out-of-line xattr entry has an inline value"
+            )
+        if entry.out_of_line_reference is None:
+            raise XAttrSemanticValueResolutionError(
+                "Out-of-line xattr entry is missing its reference"
+            )
+        try:
+            raw_value = read_xattr_out_of_line_value(image, entry, table)
+        except SquashFSXAttrValueError as error:
+            raise XAttrSemanticValueResolutionError(
+                "Cannot resolve out-of-line xattr value"
+            ) from error
+    else:
+        if not isinstance(entry.value, bytes):
+            raise XAttrSemanticValueResolutionError(
+                "Inline xattr entry is missing a bytes value"
+            )
+        if entry.out_of_line_reference is not None:
+            raise XAttrSemanticValueResolutionError(
+                "Inline xattr entry has an out-of-line reference"
+            )
+        raw_value = entry.value
+    return decode_xattr_semantic(entry, raw_value)
 
 
 class SquashFSMetadataStreamError(ValueError):

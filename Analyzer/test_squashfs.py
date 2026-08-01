@@ -129,6 +129,10 @@ from squashfs import (
     XATTR_CAPS_SZ_2, XATTR_CAPS_SZ_3, LinuxCapabilitySet,
     VFS_CAP_U32_1, VFS_CAP_U32_2,
     LINUX_CAPABILITY_NAMES, LINUX_CAP_LAST_KNOWN,
+    XAttrSemanticKind, XAttrSemanticError, XAttrSemanticTypeError,
+    XAttrSemanticDecoderError, UnknownXAttrSemanticValue, XAttrSemanticDecoder,
+    XAttrSemanticValueResolutionError, DecodedXAttr, XATTR_SEMANTIC_DECODERS,
+    decode_xattr_semantic, read_and_decode_xattr,
 )
 
 
@@ -193,6 +197,332 @@ class LinuxFileCapabilitiesStage21BTest(unittest.TestCase):
             with self.assertRaises(LinuxCapabilitySizeError) as caught: decode_linux_file_capabilities(valid)
         self.assertIsInstance(caught.exception.__cause__,struct.error)
 
+
+class XAttrSemanticDispatchStage22BTest(unittest.TestCase):
+    RAW = struct.pack('<III', VFS_CAP_REVISION_1, 1, 0)
+
+    def entry(self, full_name=b'security.capability'):
+        return SquashFSXAttrEntry(
+            2, decode_xattr_namespace(2), b'capability', full_name,
+            b'inline', len(b'inline'), False, None,
+        )
+
+    def test_public_api_registry_and_descriptor_contract(self):
+        self.assertTrue(callable(decode_xattr_semantic))
+        self.assertEqual(tuple(XATTR_SEMANTIC_DECODERS), (b'security.capability',))
+        descriptor = XATTR_SEMANTIC_DECODERS[b'security.capability']
+        self.assertEqual(
+            (descriptor.decoder_id, descriptor.kind, descriptor.decode),
+            ('linux.security.capability', XAttrSemanticKind.LINUX_FILE_CAPABILITIES,
+             decode_linux_file_capabilities),
+        )
+        with self.assertRaises(TypeError):
+            XATTR_SEMANTIC_DECODERS[b'x'] = descriptor
+        with self.assertRaises(AttributeError):
+            descriptor.decoder_id = 'changed'
+
+    def test_known_capability_result_and_raw_provenance(self):
+        entry = self.entry()
+        result = decode_xattr_semantic(entry, self.RAW)
+        self.assertEqual(
+            (result.entry, result.raw_value, result.kind, result.decoder_id, result.known),
+            (entry, self.RAW, XAttrSemanticKind.LINUX_FILE_CAPABILITIES,
+             'linux.security.capability', True),
+        )
+        self.assertIsInstance(result.semantic_value, squashfs.LinuxFileCapabilities)
+        self.assertEqual(result.semantic_value, decode_linux_file_capabilities(self.RAW))
+        with self.assertRaises(AttributeError):
+            result.known = False
+
+    def test_all_bytes_like_inputs_are_normalized_and_copied(self):
+        for raw in (self.RAW, bytearray(self.RAW), memoryview(self.RAW)):
+            result = decode_xattr_semantic(self.entry(), raw)
+            self.assertEqual((result.raw_value, type(result.raw_value)), (self.RAW, bytes))
+        mutable = bytearray(self.RAW)
+        result = decode_xattr_semantic(self.entry(), mutable)
+        mutable[4] = 0
+        self.assertEqual(result.raw_value, self.RAW)
+
+    def test_invalid_public_arguments_are_typed(self):
+        for entry, raw in ((object(), self.RAW), (self.entry(), 'not-bytes'),
+                           (self.entry(), object())):
+            with self.assertRaises(XAttrSemanticTypeError) as caught:
+                decode_xattr_semantic(entry, raw)
+            self.assertIsInstance(caught.exception, XAttrSemanticError)
+        invalid_name_entry = SquashFSXAttrEntry(
+            2, decode_xattr_namespace(2), b'capability', 'security.capability',
+            b'', 0, False, None,
+        )
+        with self.assertRaises(XAttrSemanticTypeError):
+            decode_xattr_semantic(invalid_name_entry, self.RAW)
+
+    def test_unknown_names_preserve_exact_binary_provenance(self):
+        for full_name in (b'user.note', None, b'security.Capability',
+                          b'security.capability.extra', b'trusted.capability',
+                          b'\xff\x00name'):
+            result = decode_xattr_semantic(self.entry(full_name), b'\x00\xffdata')
+            self.assertEqual(
+                (result.known, result.kind, result.decoder_id, result.raw_value),
+                (False, XAttrSemanticKind.UNKNOWN, None, b'\x00\xffdata'),
+            )
+            self.assertIsInstance(result.semantic_value, UnknownXAttrSemanticValue)
+            self.assertEqual(
+                (result.semantic_value.full_name, result.semantic_value.raw_value),
+                (full_name, b'\x00\xffdata'),
+            )
+
+    def test_unknown_and_known_results_are_immutable_and_equal(self):
+        unknown = decode_xattr_semantic(self.entry(b'user.note'), b'value')
+        self.assertEqual(unknown, decode_xattr_semantic(self.entry(b'user.note'), b'value'))
+        self.assertEqual(decode_xattr_semantic(self.entry(), self.RAW),
+                         decode_xattr_semantic(self.entry(), self.RAW))
+        with self.assertRaises(AttributeError):
+            unknown.semantic_value.raw_value = b'changed'
+
+    def test_capability_failure_is_wrapped_with_original_cause(self):
+        with self.assertRaises(XAttrSemanticDecoderError) as caught:
+            decode_xattr_semantic(self.entry(), b'')
+        self.assertIsInstance(caught.exception.__cause__, LinuxCapabilityError)
+        self.assertNotIsInstance(caught.exception, LinuxCapabilityError)
+
+    def test_direct_model_and_descriptor_invariants_reject_invalid_states(self):
+        entry = self.entry()
+        unknown = UnknownXAttrSemanticValue(entry.full_name, b'value')
+        capability = decode_linux_file_capabilities(self.RAW)
+        with self.assertRaises(ValueError):
+            UnknownXAttrSemanticValue('text', b'value')
+        with self.assertRaises(ValueError):
+            UnknownXAttrSemanticValue(entry.full_name, bytearray(b'value'))
+        with self.assertRaises(ValueError):
+            DecodedXAttr(object(), b'value', XAttrSemanticKind.LINUX_FILE_CAPABILITIES,
+                         'id', True, capability)
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, bytearray(b'value'), XAttrSemanticKind.LINUX_FILE_CAPABILITIES,
+                         'id', True, capability)
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, b'value', 'not-a-kind', 'id', True, capability)
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, b'value', XAttrSemanticKind.LINUX_FILE_CAPABILITIES,
+                         'id', 1, capability)
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, b'value', XAttrSemanticKind.UNKNOWN, None, True, unknown)
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, b'value', XAttrSemanticKind.LINUX_FILE_CAPABILITIES,
+                         None, True, object())
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, b'value', XAttrSemanticKind.LINUX_FILE_CAPABILITIES,
+                         'id', True, unknown)
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, b'value', XAttrSemanticKind.UNKNOWN, 'x', False, unknown)
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, b'other', XAttrSemanticKind.UNKNOWN, None, False, unknown)
+        with self.assertRaises(ValueError):
+            DecodedXAttr(entry, b'value', XAttrSemanticKind.UNKNOWN, None, False, object())
+        with self.assertRaises(ValueError):
+            DecodedXAttr(self.entry(b'user.note'), b'value', XAttrSemanticKind.UNKNOWN,
+                         None, False, unknown)
+        for args in (('', XAttrSemanticKind.LINUX_FILE_CAPABILITIES, lambda value: value),
+                     ('id', XAttrSemanticKind.UNKNOWN, lambda value: value),
+                     ('id', XAttrSemanticKind.LINUX_FILE_CAPABILITIES, object())):
+            with self.assertRaises(ValueError):
+                XAttrSemanticDecoder(*args)
+
+    def test_dispatcher_has_no_transport_or_host_access(self):
+        with (patch.object(squashfs, 'read_xattr_out_of_line_value',
+                           side_effect=AssertionError('OOL access')),
+              patch.object(squashfs, 'read_xattr_list',
+                           side_effect=AssertionError('list access')),
+              patch.object(squashfs, 'read_inode_xattrs',
+                           side_effect=AssertionError('inode access'))):
+            self.assertTrue(decode_xattr_semantic(self.entry(), self.RAW).known)
+
+
+class XAttrSemanticTransportStage22C2Test(unittest.TestCase):
+    RAW = struct.pack('<III', VFS_CAP_REVISION_1, 1, 0)
+
+    def target_image(self, payload):
+        target = struct.pack('<I', len(payload)) + payload
+        directory = tempfile.TemporaryDirectory(); path = Path(directory.name) / 'semantic-ool.sqfs'
+        xstart = 128; idmeta = xstart + 2 + len(target) + 16; table = idmeta + 18; end = table + 24
+        raw = bytearray(end)
+        raw[:96] = struct.pack('<IIIIIHHHHHHQQQQQQQQ', SQUASHFS_MAGIC, 1, 0, 4096, 0, 6, 12, 0, 1, 4, 0, 0, end, 0, table, 0, 0, 0, 0)
+        raw[xstart:xstart + 2] = struct.pack('<H', METADATA_UNCOMPRESSED_BIT | len(target))
+        raw[xstart + 2:xstart + 2 + len(target)] = target
+        raw[idmeta:idmeta + 2] = struct.pack('<H', METADATA_UNCOMPRESSED_BIT | 16)
+        raw[idmeta + 2:idmeta + 18] = XATTR_ID_STRUCT.pack(0, 1, 0)
+        raw[table:table + 16] = struct.pack('<QII', xstart, 1, 0)
+        raw[table + 16:table + 24] = struct.pack('<Q', idmeta)
+        path.write_bytes(raw)
+        self.addCleanup(directory.cleanup)
+        return SquashFSImage(path)
+
+    @staticmethod
+    def inline_entry(name=b'security.capability', value=RAW):
+        return SquashFSXAttrEntry(2, decode_xattr_namespace(2), b'capability', name,
+                                  value, len(value), False, None)
+
+    @staticmethod
+    def ool_entry(name=b'security.capability', reference=0):
+        return SquashFSXAttrEntry(0x102, decode_xattr_namespace(2), b'capability', name,
+                                  None, 8, True, reference)
+
+    def test_public_inline_path_is_lazy_immutable_and_ignores_table(self):
+        image = self.target_image(b'unused')
+        entry = self.inline_entry(); before = entry; table = read_xattr_id_table(image)
+        with (patch.object(squashfs, 'read_xattr_out_of_line_value', side_effect=AssertionError('OOL')),
+              patch.object(squashfs, 'read_xattr_list', side_effect=AssertionError('list')),
+              patch.object(squashfs, 'read_inode_xattrs', side_effect=AssertionError('inode')),
+              patch.object(image, 'read_metadata_block', side_effect=AssertionError('metadata'))):
+            result = read_and_decode_xattr(image, entry, table)
+        self.assertIsInstance(result, DecodedXAttr)
+        self.assertEqual((result.entry, result.raw_value, result.known), (entry, self.RAW, True))
+        self.assertEqual(entry, before)
+        self.assertEqual(result, read_and_decode_xattr(image, entry, table))
+        self.assertEqual(result, read_and_decode_xattr(image, entry))
+        with self.assertRaises(AttributeError): result.raw_value = b'changed'
+
+    def test_inline_unknown_and_malformed_states_are_typed(self):
+        image = self.target_image(b'unused')
+        unknown = read_and_decode_xattr(image, self.inline_entry(b'user.note', b'\0\xff'))
+        self.assertEqual((unknown.known, unknown.kind, unknown.raw_value),
+                         (False, XAttrSemanticKind.UNKNOWN, b'\0\xff'))
+        malformed = (
+            SquashFSXAttrEntry(2, decode_xattr_namespace(2), b'n', b'security.n', None, 0, False, None),
+            SquashFSXAttrEntry(2, decode_xattr_namespace(2), b'n', b'security.n', b'x', 1, False, 0),
+            SquashFSXAttrEntry(2, decode_xattr_namespace(2), b'n', b'security.n', bytearray(b'x'), 1, False, None),
+        )
+        for entry in malformed:
+            with self.assertRaises(XAttrSemanticValueResolutionError) as caught:
+                read_and_decode_xattr(image, entry)
+            self.assertIsNone(caught.exception.__cause__)
+
+    def test_physical_ool_capability_reuses_table_once_and_preserves_entry(self):
+        image = self.target_image(self.RAW); table = read_xattr_id_table(image)
+        entry = self.ool_entry(); before = entry; table_before = table
+        with patch('squashfs.read_xattr_out_of_line_value', wraps=read_xattr_out_of_line_value) as resolver:
+            result = read_and_decode_xattr(image, entry, table)
+        self.assertEqual(resolver.call_count, 1)
+        self.assertEqual(resolver.call_args.args, (image, entry, table))
+        self.assertEqual((result.raw_value, result.known, result.entry), (self.RAW, True, entry))
+        self.assertEqual((entry, entry.out_of_line_reference), (before, 0))
+        self.assertEqual(table, table_before)
+        self.assertIsInstance(result.semantic_value, squashfs.LinuxFileCapabilities)
+        with self.assertRaises(AttributeError): result.raw_value = b'changed'
+
+    def test_physical_ool_unknown_none_table_and_repeat_are_deterministic(self):
+        image = self.target_image(b'\0\xffunknown'); entry = self.ool_entry(b'user.note')
+        with patch('squashfs.read_xattr_id_table', wraps=read_xattr_id_table) as reads:
+            first = read_and_decode_xattr(image, entry)
+            second = read_and_decode_xattr(image, entry)
+        self.assertEqual(reads.call_count, 2)
+        self.assertEqual((first, second), (second, first))
+        self.assertEqual((first.known, first.raw_value, first.semantic_value.full_name),
+                         (False, b'\0\xffunknown', b'user.note'))
+        self.assertEqual((entry.value, entry.out_of_line_reference), (None, 0))
+
+    def test_wrapper_argument_and_ool_state_validation_is_typed(self):
+        image = self.target_image(self.RAW); entry = self.ool_entry()
+        for arguments in ((object(), entry, None), (image, object(), None),
+                          (image, entry, object())):
+            with self.assertRaises(XAttrSemanticTypeError):
+                read_and_decode_xattr(*arguments)
+        for malformed in (
+            SquashFSXAttrEntry(0x102, decode_xattr_namespace(2), b'n', b'security.n', None, 8, True, None),
+            SquashFSXAttrEntry(0x102, decode_xattr_namespace(2), b'n', b'security.n', b'x', 8, True, 0),
+        ):
+            with self.assertRaises(XAttrSemanticValueResolutionError):
+                read_and_decode_xattr(image, malformed)
+
+    def test_transport_and_semantic_errors_preserve_distinct_causes(self):
+        image = self.target_image(self.RAW); entry = self.ool_entry()
+        with patch('squashfs.read_xattr_out_of_line_value',
+                   side_effect=SquashFSXAttrValueError('broken')):
+            with self.assertRaises(XAttrSemanticValueResolutionError) as caught:
+                read_and_decode_xattr(image, entry)
+        self.assertIsInstance(caught.exception.__cause__, SquashFSXAttrValueError)
+        bad_image = self.target_image(b'')
+        with self.assertRaises(XAttrSemanticDecoderError) as caught:
+            read_and_decode_xattr(bad_image, self.ool_entry())
+        self.assertIsInstance(caught.exception.__cause__, LinuxCapabilityError)
+
+    def test_wrapper_does_not_call_list_or_inode_transport(self):
+        image = self.target_image(self.RAW)
+        with (patch.object(squashfs, 'read_xattr_list', side_effect=AssertionError('list')),
+              patch.object(squashfs, 'read_inode_xattrs', side_effect=AssertionError('inode'))):
+            self.assertTrue(read_and_decode_xattr(image, self.ool_entry()).known)
+
+    def test_existing_decoder_error_is_propagated_by_identity(self):
+        image = self.target_image(b'unused'); expected = XAttrSemanticDecoderError('expected')
+        with (patch.object(squashfs, 'decode_xattr_semantic', side_effect=expected) as decoder,
+              patch.object(squashfs, 'read_xattr_out_of_line_value', side_effect=AssertionError('OOL'))):
+            with self.assertRaises(XAttrSemanticDecoderError) as caught:
+                read_and_decode_xattr(image, self.inline_entry())
+        self.assertIs(caught.exception, expected); self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(decoder.call_count, 1)
+
+    def test_physical_ool_wrapper_reads_through_metadata_stream(self):
+        image = self.target_image(self.RAW); entry = self.ool_entry()
+        original = SquashFSMetadataStream.read
+        with patch.object(SquashFSMetadataStream, 'read', autospec=True, wraps=original) as reads:
+            result = read_and_decode_xattr(image, entry)
+        self.assertGreaterEqual(reads.call_count, 2)
+        self.assertEqual((result.raw_value, result.semantic_value.raw_value, entry.out_of_line_reference),
+                         (self.RAW, self.RAW, 0))
+
+    def test_decoded_semantic_result_snapshot_remains_immutable(self):
+        source = bytes(self.RAW); image = self.target_image(source); table = read_xattr_id_table(image); entry = self.ool_entry()
+        result = read_and_decode_xattr(image, entry, table); snapshot = (result, result.semantic_value, result.entry, result.raw_value, table)
+        again = read_and_decode_xattr(image, entry, table)
+        self.assertEqual((result, result.semantic_value, result.entry, result.raw_value, table), snapshot)
+        self.assertEqual(result, again); self.assertEqual(result.semantic_value, again.semantic_value)
+        with self.assertRaises(AttributeError): result.raw_value = b'x'
+        with self.assertRaises(AttributeError): result.semantic_value.raw_value = b'x'
+
+
+class XAttrSemanticROOTFSStage22DTest(unittest.TestCase):
+    RAW=bytes.fromhex('0100000200200000000000000000000000000000')
+    def image(self,payload): return XAttrSemanticTransportStage22C2Test.target_image(self,payload)
+    def entry(self,name=b'security.capability',ref=0): return XAttrSemanticTransportStage22C2Test.ool_entry(name,ref)
+    def live(self):
+        image=SquashFSImage(ROOTFS); table=read_xattr_id_table(image); listing=read_xattr_list(image,read_xattr_id(image,0,table),table)
+        return image,table,next(e for e in listing.entries if e.full_name==b'security.capability')
+    def test_live_rootfs_capability_dispatch(self):
+        image,table,entry=self.live(); result=read_and_decode_xattr(image,entry,table)
+        self.assertEqual((type(result),result.known,result.kind,result.decoder_id,result.raw_value),(DecodedXAttr,True,XAttrSemanticKind.LINUX_FILE_CAPABILITIES,'linux.security.capability',self.RAW))
+        value=result.semantic_value; self.assertEqual((value.revision,value.effective,value.permitted.raw_mask,value.permitted.capability_numbers,value.permitted.known_names,value.inheritable.capability_numbers,value.root_id),(LinuxCapabilityRevision.REVISION_2,True,0x2000,(13,),('CAP_NET_RAW',),(),None))
+    def test_live_inline_avoids_ool_resolver(self):
+        image,table,entry=self.live()
+        with patch('squashfs.read_xattr_out_of_line_value',side_effect=AssertionError('OOL')) as resolver: result=read_and_decode_xattr(image,entry,table)
+        self.assertEqual(resolver.call_count,0); self.assertEqual((entry.value,table,result.entry),(self.RAW,table,entry))
+    def test_live_pure_wrapper_equality(self):
+        image,table,entry=self.live(); self.assertEqual(read_and_decode_xattr(image,entry,table),decode_xattr_semantic(entry,entry.value))
+    def test_synthetic_physical_ool_capability(self):
+        image=self.image(self.RAW); table=read_xattr_id_table(image); entry=self.entry(); first=read_and_decode_xattr(image,entry,table); second=read_and_decode_xattr(image,entry)
+        self.assertEqual((first.known,first.decoder_id,first.semantic_value,first,entry.out_of_line_reference),(True,'linux.security.capability',decode_linux_file_capabilities(self.RAW),second,0))
+    def test_synthetic_unknown_inline(self):
+        image=self.image(b'x'); entry=SquashFSXAttrEntry(0,decode_xattr_namespace(0),b'unknown',b'user.unknown',b'\0\xff',2,False,None); result=read_and_decode_xattr(image,entry)
+        self.assertEqual((result.known,result.kind,result.decoder_id,result.semantic_value.full_name,result.raw_value),(False,XAttrSemanticKind.UNKNOWN,None,b'user.unknown',b'\0\xff'))
+    def test_synthetic_unknown_ool(self):
+        image=self.image(b'\0\xff'); entry=self.entry(b'user.unknown'); first=read_and_decode_xattr(image,entry); second=read_and_decode_xattr(image,entry)
+        self.assertEqual((first,first.raw_value,entry.out_of_line_reference),(second,b'\0\xff',0))
+    def test_exact_name_matching(self):
+        image=self.image(b'x')
+        for name in (b'Security.capability',b'security.capabilities',b'user.capability'):
+            self.assertEqual(read_and_decode_xattr(image,SquashFSXAttrEntry(0,decode_xattr_namespace(0),b'n',name,b'x',1,False,None)).kind,XAttrSemanticKind.UNKNOWN)
+    def test_transport_failure_chain(self):
+        image=self.image(self.RAW); entry=self.entry()
+        with patch('squashfs.read_xattr_out_of_line_value',side_effect=SquashFSXAttrValueError('bad')):
+            with self.assertRaises(XAttrSemanticValueResolutionError) as caught: read_and_decode_xattr(image,entry)
+        self.assertIsInstance(caught.exception.__cause__,SquashFSXAttrValueError)
+    def test_semantic_failure_chain(self):
+        image=self.image(b'');
+        with self.assertRaises(XAttrSemanticDecoderError) as caught: read_and_decode_xattr(image,self.entry())
+        self.assertIsInstance(caught.exception.__cause__,LinuxCapabilityError)
+    def test_immutability_and_repeated_snapshots(self):
+        image=self.image(self.RAW); table=read_xattr_id_table(image); entry=self.entry(); result=read_and_decode_xattr(image,entry,table); snapshot=(result,result.semantic_value,entry,table,result.raw_value)
+        self.assertEqual((read_and_decode_xattr(image,entry,table),result.semantic_value,entry,table,result.raw_value),snapshot)
+        with self.assertRaises(AttributeError): result.raw_value=b'x'
+        with self.assertRaises(AttributeError): result.semantic_value.raw_value=b'x'
 
 class LinuxCapabilityNamesStage21C1Test(unittest.TestCase):
     def test_mapping_is_complete_immutable_and_exact(self):
