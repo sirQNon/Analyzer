@@ -744,6 +744,170 @@ class SquashFSDirectoryIndexError(SquashFSDirectoryError):
     """An extended-directory index record is malformed or incomplete."""
 
 
+class SquashFSFilesystemGraphError(ValueError):
+    """A filesystem object-graph model or operation is invalid."""
+
+
+class SquashFSRootError(SquashFSFilesystemGraphError):
+    """The SquashFS root cannot be opened as a supported directory."""
+
+
+class SquashFSGraphReadError(SquashFSFilesystemGraphError):
+    """A graph operation cannot read its required low-level object."""
+
+
+class SquashFSNodeTypeError(SquashFSFilesystemGraphError):
+    """A graph node's declared type disagrees with its typed inode."""
+
+class SquashFSDirectoryReadError(SquashFSGraphReadError): pass
+class SquashFSChildInodeError(SquashFSGraphReadError): pass
+class SquashFSDirectoryEntryError(SquashFSFilesystemGraphError): pass
+class SquashFSPathError(SquashFSFilesystemGraphError): pass
+class SquashFSPathNotFoundError(SquashFSPathError): pass
+class SquashFSNotDirectoryError(SquashFSPathError): pass
+class SquashFSDuplicateNameError(SquashFSPathError): pass
+class SquashFSDirectoryCycleError(SquashFSFilesystemGraphError): pass
+class SquashFSFilesystemIndexError(SquashFSFilesystemGraphError): pass
+class SquashFSNodeContentError(SquashFSGraphReadError): pass
+
+
+class SquashFSNodeType(Enum):
+    DIRECTORY = "directory"
+    REGULAR_FILE = "regular_file"
+    SYMLINK = "symlink"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True)
+class SquashFSInodeIdentity:
+    reference: SquashFSMetadataReference
+    inode_number: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reference, SquashFSMetadataReference):
+            raise SquashFSFilesystemGraphError("Inode identity reference is invalid")
+        if not isinstance(self.inode_number, int) or isinstance(self.inode_number, bool) or self.inode_number < 0:
+            raise SquashFSFilesystemGraphError("Inode identity number must be non-negative")
+
+
+@dataclass(frozen=True)
+class SquashFSFilesystem:
+    image: SquashFSImage
+    superblock: SquashFSSuperBlock
+    inode_stream: SquashFSMetadataStream
+    root_inode: SquashFSInode
+    root_identity: SquashFSInodeIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image, SquashFSImage) or not isinstance(self.superblock, SquashFSSuperBlock):
+            raise SquashFSFilesystemGraphError("Filesystem image or superblock is invalid")
+        if not isinstance(self.inode_stream, SquashFSMetadataStream) or self.inode_stream.image is not self.image:
+            raise SquashFSFilesystemGraphError("Filesystem inode stream is invalid")
+        if not isinstance(self.root_inode, SquashFSInode) or not isinstance(self.root_identity, SquashFSInodeIdentity):
+            raise SquashFSFilesystemGraphError("Filesystem root is invalid")
+        if (self.root_identity.reference, self.root_identity.inode_number) != (self.root_inode.reference, self.root_inode.header.inode_number):
+            raise SquashFSFilesystemGraphError("Filesystem root identity does not match inode")
+
+
+@dataclass(frozen=True)
+class SquashFSPathNode:
+    filesystem: SquashFSFilesystem
+    identity: SquashFSInodeIdentity
+    inode: SquashFSInode
+    raw_name: bytes | None
+    parent_path: bytes | None
+    absolute_path: bytes
+    node_type: SquashFSNodeType
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.filesystem, SquashFSFilesystem) or not isinstance(self.identity, SquashFSInodeIdentity) or not isinstance(self.inode, SquashFSInode):
+            raise SquashFSFilesystemGraphError("Path node has invalid filesystem, identity, or inode")
+        if (self.identity.reference, self.identity.inode_number) != (self.inode.reference, self.inode.header.inode_number):
+            raise SquashFSFilesystemGraphError("Path node identity does not match inode")
+        if not isinstance(self.absolute_path, bytes) or not self.absolute_path.startswith(b"/"):
+            raise SquashFSFilesystemGraphError("Path node absolute path must be absolute bytes")
+        root = self.raw_name is None
+        if root:
+            if self.parent_path is not None or self.absolute_path != b"/":
+                raise SquashFSFilesystemGraphError("Root node path fields are invalid")
+        else:
+            if not isinstance(self.raw_name, bytes) or not self.raw_name:
+                raise SquashFSFilesystemGraphError("Non-root node name must be non-empty bytes")
+            if not isinstance(self.parent_path, bytes) or not self.parent_path.startswith(b"/"):
+                raise SquashFSFilesystemGraphError("Non-root node parent path must be absolute bytes")
+
+
+@dataclass(frozen=True)
+class SquashFSDirectoryNode(SquashFSPathNode):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.node_type is not SquashFSNodeType.DIRECTORY or not isinstance(self.inode.body, (SquashFSBasicDirectoryInode, SquashFSExtendedDirectoryInode)):
+            raise SquashFSNodeTypeError("Directory node does not wrap a directory inode")
+
+
+@dataclass(frozen=True)
+class SquashFSRegularFileNode(SquashFSPathNode):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.node_type is not SquashFSNodeType.REGULAR_FILE or not isinstance(self.inode.body, (SquashFSBasicRegularInode, SquashFSExtendedRegularInode)):
+            raise SquashFSNodeTypeError("Regular-file node does not wrap a regular inode")
+
+
+@dataclass(frozen=True)
+class SquashFSSymlinkNode(SquashFSPathNode):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.node_type is not SquashFSNodeType.SYMLINK or not isinstance(self.inode.body, (SquashFSBasicSymlinkInode, SquashFSExtendedSymlinkInode)):
+            raise SquashFSNodeTypeError("Symlink node does not wrap a symlink inode")
+
+
+@dataclass(frozen=True)
+class SquashFSUnsupportedNode(SquashFSPathNode):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.node_type is not SquashFSNodeType.UNSUPPORTED or isinstance(self.inode.body, (SquashFSBasicDirectoryInode, SquashFSExtendedDirectoryInode, SquashFSBasicRegularInode, SquashFSExtendedRegularInode, SquashFSBasicSymlinkInode, SquashFSExtendedSymlinkInode)):
+            raise SquashFSNodeTypeError("Unsupported node wraps a supported inode")
+
+@dataclass(frozen=True)
+class SquashFSDirectoryListing:
+    directory_path: bytes
+    children: tuple[SquashFSPathNode, ...]
+    def __post_init__(self) -> None:
+        if not isinstance(self.directory_path, bytes) or not self.directory_path.startswith(b'/'):
+            raise SquashFSFilesystemGraphError("Directory listing path must be absolute bytes")
+        if not isinstance(self.children, tuple) or any(not isinstance(x, SquashFSPathNode) or x.parent_path != self.directory_path for x in self.children):
+            raise SquashFSFilesystemGraphError("Directory listing children are invalid")
+
+
+@dataclass(frozen=True)
+class SquashFSFilesystemIndex:
+    """Immutable, traversal-ordered view of one filesystem graph."""
+    root: SquashFSDirectoryNode
+    nodes: tuple[SquashFSPathNode, ...]
+    paths: object
+    inode_paths: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, SquashFSDirectoryNode) or not isinstance(self.nodes, tuple):
+            raise SquashFSFilesystemIndexError("Filesystem index model is invalid")
+        if not isinstance(self.paths, MappingProxyType) or not isinstance(self.inode_paths, MappingProxyType):
+            raise SquashFSFilesystemIndexError("Filesystem index mappings must be immutable")
+        if not self.nodes or self.nodes[0] != self.root or self.root.absolute_path != b"/":
+            raise SquashFSFilesystemIndexError("Filesystem index root is invalid")
+        if any(not isinstance(node, SquashFSPathNode) or not isinstance(node.absolute_path, bytes) or not node.absolute_path.startswith(b"/") for node in self.nodes):
+            raise SquashFSFilesystemIndexError("Filesystem index nodes are invalid")
+        node_paths = tuple(node.absolute_path for node in self.nodes)
+        if len(node_paths) != len(set(node_paths)):
+            raise SquashFSFilesystemIndexError("Filesystem index contains duplicate paths")
+        if set(self.paths) != set(node_paths) or any(self.paths[path] is not node for path, node in ((node.absolute_path, node) for node in self.nodes)):
+            raise SquashFSFilesystemIndexError("Filesystem index path mapping is inconsistent")
+        expected: dict[SquashFSInodeIdentity, tuple[bytes, ...]] = {}
+        for node in self.nodes:
+            expected[node.identity] = expected.get(node.identity, ()) + (node.absolute_path,)
+        if set(self.inode_paths) != set(expected) or any(not isinstance(identity, SquashFSInodeIdentity) or paths != expected.get(identity) or not isinstance(paths, tuple) for identity, paths in self.inode_paths.items()):
+            raise SquashFSFilesystemIndexError("Filesystem index inode mapping is inconsistent")
+
+
 def decode_metadata_reference(reference: int) -> SquashFSMetadataReference:
     """Decode a 64-bit SquashFS inode metadata reference without I/O."""
     if not isinstance(reference, int) or isinstance(reference, bool):
@@ -2023,6 +2187,204 @@ class SquashFSMetadataStream:
         """Read and decode only a basic directory inode."""
         data = self.read(reference, BASIC_DIRECTORY_INODE_SIZE)
         return parse_basic_directory_inode(data)
+
+
+def open_filesystem(image: SquashFSImage) -> SquashFSFilesystem:
+    """Open the typed root inode without reading children or payloads."""
+    if not isinstance(image, SquashFSImage):
+        raise SquashFSFilesystemGraphError("Filesystem image has an invalid type")
+    try:
+        superblock = image.read_superblock()
+        root_reference = decode_metadata_reference(superblock.root_inode)
+        inode_stream = SquashFSMetadataStream(image, superblock.inode_table_start)
+        root_inode = read_inode(inode_stream, root_reference)
+    except (OSError, TypeError, ValueError, SquashFSMetadataStreamError, SquashFSInodeError) as error:
+        raise SquashFSRootError("Cannot open SquashFS root inode") from error
+    if not isinstance(root_inode.body, (SquashFSBasicDirectoryInode, SquashFSExtendedDirectoryInode)):
+        raise SquashFSRootError("SquashFS root inode is not a directory")
+    identity = SquashFSInodeIdentity(root_inode.reference, root_inode.header.inode_number)
+    return SquashFSFilesystem(image, superblock, inode_stream, root_inode, identity)
+
+
+def get_root(filesystem: SquashFSFilesystem) -> SquashFSDirectoryNode:
+    """Return the immutable root node without performing further I/O."""
+    if not isinstance(filesystem, SquashFSFilesystem):
+        raise SquashFSFilesystemGraphError("Filesystem has an invalid type")
+    return SquashFSDirectoryNode(
+        filesystem, filesystem.root_identity, filesystem.root_inode,
+        None, None, b"/", SquashFSNodeType.DIRECTORY,
+    )
+
+def _child_node(filesystem, parent, record, inode):
+    if inode.reference != record.inode_reference or inode.header.inode_number != record.inode_number:
+        raise SquashFSChildInodeError("Directory child identity does not match record")
+    name = record.name
+    if not isinstance(name, bytes) or not name or b'/' in name or b'\0' in name or name in (b'.', b'..'):
+        raise SquashFSDirectoryEntryError("Directory child name is invalid")
+    path = b'/' + name if parent.absolute_path == b'/' else parent.absolute_path + b'/' + name
+    identity = SquashFSInodeIdentity(record.inode_reference, inode.header.inode_number)
+    args = (filesystem, identity, inode, name, parent.absolute_path, path)
+    if isinstance(inode.body, (SquashFSBasicDirectoryInode, SquashFSExtendedDirectoryInode)):
+        return SquashFSDirectoryNode(*args, SquashFSNodeType.DIRECTORY)
+    if isinstance(inode.body, (SquashFSBasicRegularInode, SquashFSExtendedRegularInode)):
+        return SquashFSRegularFileNode(*args, SquashFSNodeType.REGULAR_FILE)
+    if isinstance(inode.body, (SquashFSBasicSymlinkInode, SquashFSExtendedSymlinkInode)):
+        return SquashFSSymlinkNode(*args, SquashFSNodeType.SYMLINK)
+    return SquashFSUnsupportedNode(*args, SquashFSNodeType.UNSUPPORTED)
+
+def list_children(filesystem: SquashFSFilesystem, directory: SquashFSDirectoryNode) -> SquashFSDirectoryListing:
+    if not isinstance(filesystem, SquashFSFilesystem):
+        raise SquashFSFilesystemGraphError("Filesystem or directory has an invalid type")
+    if not isinstance(directory, SquashFSDirectoryNode):
+        raise SquashFSNodeTypeError("Node is not a directory")
+    if directory.filesystem is not filesystem:
+        raise SquashFSFilesystemGraphError("Directory belongs to another filesystem")
+    try:
+        records = read_directory(SquashFSMetadataStream(filesystem.image, filesystem.superblock.directory_table_start), directory.inode.body)
+    except (KeyError, IndexError, TypeError, ValueError, SquashFSMetadataStreamError) as error:
+        raise SquashFSDirectoryReadError("Cannot read directory") from error
+    children=[]
+    for record in records:
+        try: inode=read_inode(filesystem.inode_stream, record.inode_reference)
+        except (KeyError, IndexError, TypeError, ValueError, SquashFSMetadataStreamError, SquashFSInodeError) as error:
+            raise SquashFSChildInodeError("Cannot read directory child inode") from error
+        children.append(_child_node(filesystem,directory,record,inode))
+    return SquashFSDirectoryListing(directory.absolute_path, tuple(children))
+
+
+def _path_components(path: bytes) -> tuple[bytes, ...]:
+    if not isinstance(path, bytes):
+        raise SquashFSPathError("Path must be bytes")
+    if path == b"/":
+        return ()
+    if not path or not path.startswith(b"/") or path.endswith(b"/"):
+        raise SquashFSPathError("Path must be a non-root absolute bytes path without a trailing slash")
+    components = path[1:].split(b"/")
+    if any(not part or b"\0" in part or part in (b".", b"..") for part in components):
+        raise SquashFSPathError("Path contains an invalid component")
+    return tuple(components)
+
+
+def lookup_path(filesystem: SquashFSFilesystem, path: bytes) -> SquashFSPathNode:
+    """Lazily resolve an absolute raw-bytes path without following symlinks."""
+    if not isinstance(filesystem, SquashFSFilesystem):
+        raise SquashFSFilesystemGraphError("Filesystem has an invalid type")
+    components = _path_components(path)
+    current: SquashFSPathNode = get_root(filesystem)
+    for position, component in enumerate(components):
+        if not isinstance(current, SquashFSDirectoryNode):
+            raise SquashFSNotDirectoryError("Path component is not a directory: " + repr(current.absolute_path))
+        matches = tuple(child for child in list_children(filesystem, current).children if child.raw_name == component)
+        if not matches:
+            raise SquashFSPathNotFoundError("Path component was not found: " + repr(component))
+        if len(matches) != 1:
+            raise SquashFSDuplicateNameError("Duplicate directory name at " + repr(current.absolute_path) + ": " + repr(component))
+        current = matches[0]
+        if position + 1 < len(components) and not isinstance(current, SquashFSDirectoryNode):
+            raise SquashFSNotDirectoryError("Path component is not a directory: " + repr(current.absolute_path))
+    return current
+
+
+def walk_filesystem(filesystem: SquashFSFilesystem):
+    """Return an immutable depth-first preorder traversal of the graph."""
+    if not isinstance(filesystem, SquashFSFilesystem):
+        raise SquashFSFilesystemGraphError("Filesystem has an invalid type")
+    root = get_root(filesystem)
+    result: list[SquashFSPathNode] = []
+    paths: set[bytes] = set()
+
+    def visit(node: SquashFSPathNode, active: tuple[SquashFSInodeIdentity, ...]) -> None:
+        if node.absolute_path in paths:
+            raise SquashFSDuplicateNameError("Duplicate absolute path: " + repr(node.absolute_path))
+        paths.add(node.absolute_path)
+        result.append(node)
+        if not isinstance(node, SquashFSDirectoryNode):
+            return
+        for child in list_children(filesystem, node).children:
+            if isinstance(child, SquashFSDirectoryNode) and child.identity in active:
+                raise SquashFSDirectoryCycleError(
+                    "Directory cycle at " + repr(child.absolute_path) + " for inode " + repr(child.identity)
+                )
+            visit(child, active + (child.identity,) if isinstance(child, SquashFSDirectoryNode) else active)
+
+    visit(root, (root.identity,))
+    return tuple(result)
+
+
+def build_filesystem_index(filesystem: SquashFSFilesystem) -> SquashFSFilesystemIndex:
+    """Build immutable forward and reverse indexes from one explicit walk."""
+    nodes = walk_filesystem(filesystem)
+    paths: dict[bytes, SquashFSPathNode] = {}
+    inode_paths: dict[SquashFSInodeIdentity, list[bytes]] = {}
+    for node in nodes:
+        if node.absolute_path in paths:
+            raise SquashFSFilesystemIndexError("Duplicate absolute path: " + repr(node.absolute_path))
+        paths[node.absolute_path] = node
+        inode_paths.setdefault(node.identity, []).append(node.absolute_path)
+    return SquashFSFilesystemIndex(get_root(filesystem), nodes, MappingProxyType(paths),
+                                   MappingProxyType({key: tuple(value) for key, value in inode_paths.items()}))
+
+
+def node_for_path(index: SquashFSFilesystemIndex, path: bytes) -> SquashFSPathNode:
+    if not isinstance(index, SquashFSFilesystemIndex):
+        raise SquashFSFilesystemIndexError("Filesystem index has an invalid type")
+    _path_components(path)
+    try:
+        return index.paths[path]
+    except KeyError as error:
+        raise SquashFSPathNotFoundError("Indexed path was not found: " + repr(path)) from error
+
+
+def paths_for_inode(index: SquashFSFilesystemIndex, inode: SquashFSInodeIdentity | int) -> tuple[bytes, ...]:
+    if not isinstance(index, SquashFSFilesystemIndex):
+        raise SquashFSFilesystemIndexError("Filesystem index has an invalid type")
+    if isinstance(inode, int) and not isinstance(inode, bool):
+        matches = [paths for identity, paths in index.inode_paths.items() if identity.inode_number == inode]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise SquashFSFilesystemIndexError("Inode number is ambiguous; use SquashFSInodeIdentity")
+        return ()
+    if not isinstance(inode, SquashFSInodeIdentity):
+        raise SquashFSFilesystemIndexError("Inode identity has an invalid type")
+    return index.inode_paths.get(inode, ())
+
+
+def read_node_bytes(filesystem: SquashFSFilesystem, node: SquashFSRegularFileNode) -> bytes:
+    if not isinstance(filesystem, SquashFSFilesystem) or not isinstance(node, SquashFSRegularFileNode):
+        raise SquashFSNodeTypeError("Node is not a regular file")
+    if node.filesystem is not filesystem:
+        raise SquashFSFilesystemGraphError("Node belongs to another filesystem")
+    try:
+        if isinstance(node.inode.body, SquashFSBasicRegularInode):
+            return read_basic_regular_file(filesystem.image, filesystem.inode_stream, node.inode)
+        return read_extended_regular_file(filesystem.image, filesystem.inode_stream, node.inode)
+    except (OSError, TypeError, ValueError, SquashFSRegularFileError, SquashFSMetadataStreamError) as error:
+        raise SquashFSNodeContentError("Cannot read regular-file node") from error
+
+
+def read_node_symlink(filesystem: SquashFSFilesystem, node: SquashFSSymlinkNode) -> str:
+    if not isinstance(filesystem, SquashFSFilesystem) or not isinstance(node, SquashFSSymlinkNode):
+        raise SquashFSNodeTypeError("Node is not a symbolic link")
+    if node.filesystem is not filesystem:
+        raise SquashFSFilesystemGraphError("Node belongs to another filesystem")
+    try:
+        if isinstance(node.inode.body, SquashFSBasicSymlinkInode):
+            return read_basic_symlink(filesystem.inode_stream, node.inode)
+        return read_extended_symlink(filesystem.inode_stream, node.inode)
+    except (OSError, TypeError, ValueError, SquashFSSymlinkError, SquashFSMetadataStreamError) as error:
+        raise SquashFSNodeContentError("Cannot read symbolic-link node") from error
+
+
+def read_node_xattrs(filesystem: SquashFSFilesystem, node: SquashFSPathNode, table: SquashFSXAttrIDTable | None = None) -> SquashFSXAttrList | None:
+    if not isinstance(filesystem, SquashFSFilesystem) or not isinstance(node, SquashFSPathNode):
+        raise SquashFSFilesystemGraphError("Filesystem or node has an invalid type")
+    if node.filesystem is not filesystem:
+        raise SquashFSFilesystemGraphError("Node belongs to another filesystem")
+    try:
+        return read_inode_xattrs(filesystem.image, node.inode, table)
+    except (AttributeError, TypeError, ValueError, SquashFSXAttrError) as error:
+        raise SquashFSNodeContentError("Cannot read node xattrs") from error
 
 
 def _read_regular_file(

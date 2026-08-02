@@ -3,6 +3,9 @@
 import struct
 import tempfile
 import unittest
+from contextlib import ExitStack
+from types import SimpleNamespace
+from types import MappingProxyType
 from unittest.mock import patch
 from pathlib import Path
 
@@ -91,6 +94,7 @@ from squashfs import (
     SquashFSFragmentIndexError,
     SquashFSFragmentTable,
     SquashFSMalformedBlockListError,
+    SquashFSRegularFileError,
     SquashFSImage,
     SquashFSMetadataError,
     SquashFSMetadataReference,
@@ -133,6 +137,18 @@ from squashfs import (
     XAttrSemanticDecoderError, UnknownXAttrSemanticValue, XAttrSemanticDecoder,
     XAttrSemanticValueResolutionError, DecodedXAttr, XATTR_SEMANTIC_DECODERS,
     decode_xattr_semantic, read_and_decode_xattr,
+    SquashFSNodeType, SquashFSInodeIdentity, SquashFSFilesystem,
+    SquashFSPathNode, SquashFSDirectoryNode, SquashFSRegularFileNode,
+    SquashFSSymlinkNode, SquashFSUnsupportedNode,
+    SquashFSDirectoryListing, SquashFSDirectoryReadError, SquashFSChildInodeError,
+    SquashFSDirectoryEntryError, list_children,
+    SquashFSFilesystemGraphError, SquashFSRootError, SquashFSNodeTypeError,
+    SquashFSPathError, SquashFSPathNotFoundError, SquashFSNotDirectoryError,
+    SquashFSDuplicateNameError, SquashFSDirectoryCycleError,
+    SquashFSFilesystemIndexError, SquashFSNodeContentError,
+    SquashFSFilesystemIndex, open_filesystem, get_root, lookup_path,
+    walk_filesystem, build_filesystem_index, node_for_path, paths_for_inode,
+    read_node_bytes, read_node_symlink, read_node_xattrs,
 )
 
 
@@ -523,6 +539,663 @@ class XAttrSemanticROOTFSStage22DTest(unittest.TestCase):
         self.assertEqual((read_and_decode_xattr(image,entry,table),result.semantic_value,entry,table,result.raw_value),snapshot)
         with self.assertRaises(AttributeError): result.raw_value=b'x'
         with self.assertRaises(AttributeError): result.semantic_value.raw_value=b'x'
+
+
+class SquashFSFilesystemRootStage23BTest(unittest.TestCase):
+    def image(self, inode_type=BASIC_DIRECTORY_INODE_TYPE, inode_number=7):
+        if inode_type == BASIC_DIRECTORY_INODE_TYPE:
+            body = BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(0, 2, 3, 0, 0)
+        elif inode_type == EXTENDED_DIRECTORY_INODE_TYPE:
+            body = EXTENDED_DIRECTORY_INODE_BODY_STRUCT.pack(0, 2, 3, 0, 0, 0, 0)
+        elif inode_type == BASIC_REGULAR_INODE_TYPE:
+            body = BASIC_REGULAR_INODE_BODY_STRUCT.pack(0, SQUASHFS_INVALID_FRAGMENT, 0, 0)
+        elif inode_type == BASIC_SYMLINK_INODE_TYPE:
+            body = BASIC_SYMLINK_INODE_BODY_STRUCT.pack(1, 0)
+        else:
+            body = b''
+        inode = INODE_HEADER_STRUCT.pack(inode_type, 0, 0, 0, 0, inode_number) + body
+        start = 96; raw = bytearray(start + 2 + len(inode))
+        raw[:96] = struct.pack('<IIIIIHHHHHHQQQQQQQQ', SQUASHFS_MAGIC, 1, 0, 4096, 0, 6, 12, 0, 1, 4, 0, 0, len(raw), 0, SQUASHFS_INVALID_BLK, start, 0, 0, 0)
+        raw[start:start + 2] = struct.pack('<H', METADATA_UNCOMPRESSED_BIT | len(inode)); raw[start + 2:] = inode
+        directory = tempfile.TemporaryDirectory(); path = Path(directory.name) / 'root.sqfs'; path.write_bytes(raw); self.addCleanup(directory.cleanup)
+        return SquashFSImage(path)
+
+    def test_enum_identity_and_immutability(self):
+        self.assertEqual(tuple(SquashFSNodeType), (SquashFSNodeType.DIRECTORY, SquashFSNodeType.REGULAR_FILE, SquashFSNodeType.SYMLINK, SquashFSNodeType.UNSUPPORTED))
+        fs = open_filesystem(self.image()); identity = SquashFSInodeIdentity(fs.root_inode.reference, 7)
+        self.assertEqual(identity, fs.root_identity)
+        with self.assertRaises(AttributeError): identity.inode_number = 8
+        with self.assertRaises(SquashFSFilesystemGraphError): SquashFSInodeIdentity(object(), 0)
+        with self.assertRaises(SquashFSFilesystemGraphError): SquashFSInodeIdentity(identity.reference, -1)
+
+    def test_basic_root_and_repeated_get_root(self):
+        fs = open_filesystem(self.image()); first = get_root(fs); second = get_root(fs)
+        self.assertEqual((first.raw_name, first.parent_path, first.absolute_path, first.node_type), (None, None, b'/', SquashFSNodeType.DIRECTORY))
+        self.assertEqual((first.identity, first.inode), (fs.root_identity, fs.root_inode)); self.assertEqual(first, second)
+        with self.assertRaises(AttributeError): first.absolute_path = b'/x'
+        self.assertNotIn('parent', first.__dataclass_fields__)
+
+    def test_extended_root(self):
+        fs = open_filesystem(self.image(EXTENDED_DIRECTORY_INODE_TYPE, 11)); root = get_root(fs)
+        self.assertIsInstance(fs.root_inode.body, SquashFSExtendedDirectoryInode)
+        self.assertEqual((root.node_type, root.identity.inode_number), (SquashFSNodeType.DIRECTORY, 11))
+
+    def test_errors_and_model_mismatch(self):
+        with self.assertRaises(SquashFSFilesystemGraphError): open_filesystem(object())
+        with self.assertRaises(SquashFSRootError): open_filesystem(self.image(BASIC_REGULAR_INODE_TYPE))
+        with self.assertRaises(SquashFSRootError): open_filesystem(self.image(BASIC_SYMLINK_INODE_TYPE))
+        fs = open_filesystem(self.image()); root = get_root(fs)
+        with self.assertRaises(SquashFSNodeTypeError): SquashFSRegularFileNode(fs, root.identity, root.inode, None, None, b'/', SquashFSNodeType.REGULAR_FILE)
+        with self.assertRaises(SquashFSFilesystemGraphError): SquashFSPathNode(fs, SquashFSInodeIdentity(root.identity.reference, 9), root.inode, None, None, b'/', SquashFSNodeType.DIRECTORY)
+
+    def test_filesystem_and_root_identity_invariants(self):
+        fs = open_filesystem(self.image()); root = get_root(fs)
+        with self.assertRaises(AttributeError): fs.root_inode = root.inode
+        with self.assertRaises(SquashFSFilesystemGraphError): SquashFSFilesystem(fs.image, fs.superblock, fs.inode_stream, fs.root_inode, SquashFSInodeIdentity(SquashFSMetadataReference(1, 0), root.identity.inode_number))
+        with self.assertRaises(SquashFSFilesystemGraphError): SquashFSFilesystem(fs.image, fs.superblock, fs.inode_stream, fs.root_inode, SquashFSInodeIdentity(root.identity.reference, root.identity.inode_number + 1))
+        with self.assertRaises(SquashFSFilesystemGraphError): SquashFSFilesystem(fs.image, fs.superblock, SquashFSMetadataStream(self.image(), 96), fs.root_inode, root.identity)
+
+    def test_path_node_direct_invariant_matrix(self):
+        fs = open_filesystem(self.image()); root = get_root(fs); i = root.identity; n = root.inode
+        bad = ((object(), i, n, None, None, b'/'), (fs, object(), n, None, None, b'/'), (fs, i, object(), None, None, b'/'), (fs, i, n, b'', b'/', b'/x'), (fs, i, n, 'x', b'/', b'/x'), (fs, i, n, b'x', None, b'/x'), (fs, i, n, b'x', b'x', b'/x'), (fs, i, n, b'x', b'/', 'x'), (fs, i, n, b'x', b'/', b'x'), (fs, i, n, None, b'/', b'/'), (fs, i, n, None, None, b'/x'))
+        for args in bad:
+            with self.assertRaises(SquashFSFilesystemGraphError): SquashFSPathNode(*args, SquashFSNodeType.DIRECTORY)
+        with self.assertRaises(SquashFSNodeTypeError): SquashFSDirectoryNode(fs, i, n, None, None, b'/', SquashFSNodeType.REGULAR_FILE)
+        with self.assertRaises(SquashFSNodeTypeError): SquashFSSymlinkNode(fs, i, n, None, None, b'/', SquashFSNodeType.SYMLINK)
+        with self.assertRaises(SquashFSNodeTypeError): SquashFSUnsupportedNode(fs, i, n, None, None, b'/', SquashFSNodeType.UNSUPPORTED)
+
+    def test_root_failure_cause_matrix(self):
+        image = self.image()
+        for symbol, error in (('read_superblock', OSError('super')), ('SquashFSMetadataStream', ValueError('stream')), ('read_inode', SquashFSInodeError('inode'))):
+            target = image if symbol == 'read_superblock' else squashfs
+            with patch.object(target, symbol, side_effect=error):
+                with self.assertRaises(SquashFSRootError) as caught: open_filesystem(image)
+            self.assertIs(caught.exception.__cause__, error)
+        with self.assertRaises(SquashFSRootError) as caught: open_filesystem(self.image(99))
+        self.assertIsInstance(caught.exception.__cause__, SquashFSUnsupportedInodeTypeError)
+
+    def test_synthetic_lazy_call_counts(self):
+        image = self.image()
+        names=('read_directory','read_inode_xattrs','read_and_decode_xattr','read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','resolve_inode_number')
+        with ExitStack() as stack:
+            inode=stack.enter_context(patch.object(squashfs,'read_inode',wraps=squashfs.read_inode)); spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]
+            fs=open_filesystem(image); self.assertEqual(inode.call_count,1); get_root(fs); self.assertEqual(inode.call_count,1)
+            self.assertTrue(all(spy.call_count == 0 for spy in spies))
+
+    def test_real_rootfs_lazy_call_counts(self):
+        image=SquashFSImage(ROOTFS); names=('read_directory','read_inode_xattrs','read_and_decode_xattr','read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','resolve_inode_number')
+        with ExitStack() as stack:
+            inode=stack.enter_context(patch.object(squashfs,'read_inode',wraps=squashfs.read_inode)); spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]
+            fs=open_filesystem(image); root=get_root(fs)
+            self.assertIsInstance(root.inode.body,SquashFSBasicDirectoryInode); self.assertEqual((root.absolute_path,root.identity),(b'/',fs.root_identity)); self.assertEqual(inode.call_count,1); self.assertTrue(all(spy.call_count==0 for spy in spies))
+
+    def test_malformed_root_and_lazy_open(self):
+        image = self.image(); image.read_superblock().root_inode
+        with patch.object(squashfs, 'decode_metadata_reference', side_effect=ValueError('bad')):
+            with self.assertRaises(SquashFSRootError) as caught: open_filesystem(image)
+        self.assertIsInstance(caught.exception.__cause__, ValueError)
+        image = self.image()
+        with (patch.object(squashfs, 'read_directory', side_effect=AssertionError('directory')),
+              patch.object(squashfs, 'read_inode_xattrs', side_effect=AssertionError('xattr')),
+              patch.object(squashfs, 'read_basic_regular_file', side_effect=AssertionError('file')),
+              patch.object(squashfs, 'read_basic_symlink', side_effect=AssertionError('symlink'))):
+            fs = open_filesystem(image)
+        with patch.object(squashfs, 'read_inode', side_effect=AssertionError('reread')):
+            self.assertEqual(get_root(fs).absolute_path, b'/')
+
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_rootfs(self):
+        fs = open_filesystem(SquashFSImage(ROOTFS)); root = get_root(fs)
+        self.assertIsInstance(fs.root_inode.body, SquashFSBasicDirectoryInode)
+        self.assertEqual((root.absolute_path, root.identity.reference, root.identity.inode_number), (b'/', fs.root_inode.reference, fs.root_inode.header.inode_number))
+
+class SquashFSDirectoryListingStage23C1Test(unittest.TestCase):
+    def physical(self, records=(), extended=False):
+        child_bytes=[]; offsets=[]; cursor=EXTENDED_DIRECTORY_INODE_SIZE if extended else BASIC_DIRECTORY_INODE_SIZE
+        for name, kind, number, target in records:
+            if target is not None: offsets.append(target); continue
+            offsets.append(cursor)
+            if kind == BASIC_REGULAR_INODE_TYPE: body=BASIC_REGULAR_INODE_BODY_STRUCT.pack(0,SQUASHFS_INVALID_FRAGMENT,0,0)
+            elif kind == BASIC_DIRECTORY_INODE_TYPE: body=BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(0,2,3,0,0)
+            else: body=BASIC_SYMLINK_INODE_BODY_STRUCT.pack(1,0)
+            raw=INODE_HEADER_STRUCT.pack(kind,0,0,0,0,number)+body; child_bytes.append(raw); cursor+=len(raw)
+        entries=[]
+        for (name,kind,number,_),offset in zip(records,offsets): entries.append(DIRECTORY_ENTRY_STRUCT.pack(offset,number-1,kind,len(name)-1)+name)
+        table=(DIRECTORY_HEADER_STRUCT.pack(len(entries)-1,0,1)+b''.join(entries)) if entries else b''
+        size=3+len(table)
+        rootbody=(EXTENDED_DIRECTORY_INODE_BODY_STRUCT.pack(2,size,0,0,0,0,0) if extended else BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(0,2,size,0,0))
+        rtype=EXTENDED_DIRECTORY_INODE_TYPE if extended else BASIC_DIRECTORY_INODE_TYPE; root=INODE_HEADER_STRUCT.pack(rtype,0,0,0,0,1)+rootbody
+        inode=root+b''.join(child_bytes); istart=96; dstart=istart+2+len(inode); raw=bytearray(dstart+2+len(table))
+        raw[:96]=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,1,0,4096,0,6,12,0,1,4,0,0,len(raw),0,SQUASHFS_INVALID_BLK,istart,dstart,0,0)
+        raw[istart:istart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(inode)); raw[istart+2:dstart]=inode; raw[dstart:dstart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(table)); raw[dstart+2:]=table
+        d=tempfile.TemporaryDirectory(); p=Path(d.name)/'dir.sqfs'; p.write_bytes(raw); self.addCleanup(d.cleanup); return SquashFSImage(p)
+    def test_physical_basic_directory_fixture(self):
+        fs=open_filesystem(self.physical()); listing=list_children(fs,get_root(fs))
+        self.assertEqual(listing.children,())
+    def test_physical_extended_directory_fixture(self):
+        image=self.physical(extended=True); fs=open_filesystem(image); self.assertEqual(list_children(fs,get_root(fs)).children,())
+    def test_physical_mixed_children_fixture(self):
+        image=self.physical(((b'f',2,2,None),(b'd',1,3,None),(b'l',3,4,None))); fs=open_filesystem(image); children=list_children(fs,get_root(fs)).children
+        self.assertEqual(([x.raw_name for x in children],[type(x) for x in children]),([b'f',b'd',b'l'],[SquashFSRegularFileNode,SquashFSDirectoryNode,SquashFSSymlinkNode]))
+    def test_physical_hardlink_duplicate_and_self_reference_fixtures(self):
+        image=self.physical(((b'a',2,2,None),(b'b',2,2,BASIC_DIRECTORY_INODE_SIZE),(b'x',2,2,BASIC_DIRECTORY_INODE_SIZE),(b'x',2,2,BASIC_DIRECTORY_INODE_SIZE),(b'self',1,1,0))); fs=open_filesystem(image); children=list_children(fs,get_root(fs)).children
+        self.assertEqual([x.raw_name for x in children],[b'a',b'b',b'x',b'x',b'self']); self.assertEqual(children[0].identity,children[1].identity); self.assertIsInstance(children[-1],SquashFSDirectoryNode)
+    def test_malformed_child_names_are_rejected(self):
+        fs=open_filesystem(self.physical(((b'a',2,2,None),))); root=get_root(fs); inode=fs.root_inode
+        for name in (b'',b'a/b',b'a\0b',b'.',b'..'):
+            record=SquashFSDirectoryRecord(1,2,name,fs.root_inode.reference)
+            with patch.object(squashfs,'read_directory',return_value=[record]), patch.object(squashfs,'read_inode',return_value=inode):
+                with self.assertRaises(SquashFSDirectoryEntryError) as caught: list_children(fs,root)
+            self.assertIn('name',str(caught.exception))
+    def test_invalid_utf8_child_name_is_preserved(self):
+        image=self.physical(((b'\xff',2,2,None),)); fs=open_filesystem(image); child=list_children(fs,get_root(fs)).children[0]
+        self.assertEqual((child.raw_name,child.absolute_path),(b'\xff',b'/\xff'))
+    def test_child_inode_number_mismatch_is_rejected(self):
+        fs=open_filesystem(self.physical(((b'a',2,2,None),))); root=get_root(fs); record=SquashFSDirectoryRecord(9,2,b'a',fs.root_inode.reference)
+        with patch.object(squashfs,'read_directory',return_value=[record]), patch.object(squashfs,'read_inode',return_value=fs.root_inode):
+            with self.assertRaises(SquashFSChildInodeError): list_children(fs,root)
+    def test_child_reference_or_read_failure_is_wrapped(self):
+        fs=open_filesystem(self.physical()); root=get_root(fs); error=SquashFSInodeError('child')
+        with patch.object(squashfs,'read_directory',return_value=[SquashFSDirectoryRecord(2,2,b'a',SquashFSMetadataReference(1,0))]), patch.object(squashfs,'read_inode',side_effect=error):
+            with self.assertRaises(SquashFSChildInodeError) as caught: list_children(fs,root)
+        self.assertIs(caught.exception.__cause__,error)
+    def test_directory_read_failure_preserves_cause(self):
+        fs=open_filesystem(self.physical()); error=SquashFSDirectoryError('directory')
+        with patch.object(squashfs,'read_directory',side_effect=error):
+            with self.assertRaises(SquashFSDirectoryReadError) as caught: list_children(fs,get_root(fs))
+        self.assertIs(caught.exception.__cause__,error)
+    def test_unsupported_child_inode_is_wrapped(self):
+        fs=open_filesystem(self.physical()); root=get_root(fs); error=SquashFSUnsupportedInodeTypeError('unsupported')
+        with patch.object(squashfs,'read_directory',return_value=[SquashFSDirectoryRecord(2,99,b'x',SquashFSMetadataReference(1,0))]), patch.object(squashfs,'read_inode',side_effect=error):
+            with self.assertRaises(SquashFSChildInodeError) as caught: list_children(fs,root)
+        self.assertIs(caught.exception.__cause__,error)
+    def test_public_directory_listing_arguments_are_typed(self):
+        fs=open_filesystem(self.physical()); root=get_root(fs)
+        for args in ((object(),root),(fs,object()),(open_filesystem(self.physical()),root)):
+            with self.assertRaises(SquashFSFilesystemGraphError): list_children(*args)
+    def test_child_reference_mismatch_is_rejected(self):
+        fs=open_filesystem(self.physical()); root=get_root(fs); other=SquashFSInode(SquashFSMetadataReference(9,0),fs.root_inode.header,fs.root_inode.body)
+        record=SquashFSDirectoryRecord(1,1,b'x',fs.root_inode.reference)
+        with patch.object(squashfs,'read_directory',return_value=[record]), patch.object(squashfs,'read_inode',return_value=other):
+            with self.assertRaisesRegex(SquashFSChildInodeError,'identity'): list_children(fs,root)
+    def test_synthetic_listing_lazy_call_counts(self):
+        fs=open_filesystem(self.physical(((b'f',2,2,None),(b'd',1,3,None),(b'l',3,4,None)))); root=get_root(fs); names=('read_inode_xattrs','read_and_decode_xattr','read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','resolve_inode_number')
+        with ExitStack() as stack:
+            rd=stack.enter_context(patch.object(squashfs,'read_directory',wraps=squashfs.read_directory)); ri=stack.enter_context(patch.object(squashfs,'read_inode',wraps=squashfs.read_inode)); spies=[stack.enter_context(patch.object(squashfs,n)) for n in names]; children=list_children(fs,root).children
+        self.assertEqual((rd.call_count,ri.call_count),(1,len(children))); self.assertTrue(all(x.call_count==0 for x in spies))
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_rootfs_listing_acceptance_matrix(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); root=get_root(fs); listing=list_children(fs,root); names=[x.raw_name for x in listing.children]; bin_node=next(x for x in listing.children if x.raw_name==b'bin')
+        self.assertEqual((len(listing.children),listing.children[0].absolute_path),(13,b'/bin')); self.assertEqual(len(names),len(set(names))); self.assertIsInstance(bin_node,SquashFSDirectoryNode); self.assertEqual((bin_node.raw_name,bin_node.absolute_path),(b'bin',b'/bin')); self.assertEqual((root,fs),(get_root(fs),fs))
+    def test_listing_rejects_child_parent_path_mismatch(self):
+        fs=open_filesystem(self.physical()); root=get_root(fs); child=SquashFSDirectoryNode(fs,root.identity,root.inode,b'x',b'/other',b'/other/x',SquashFSNodeType.DIRECTORY)
+        with self.assertRaisesRegex(SquashFSFilesystemGraphError,'children'): SquashFSDirectoryListing(b'/',(child,))
+    def test_nested_directory_child_absolute_path(self):
+        fs=open_filesystem(self.physical(((b'parent',1,1,0),))); root=get_root(fs); parent=list_children(fs,root).children[0]; record=SquashFSDirectoryRecord(1,1,b'child',fs.root_inode.reference)
+        with patch.object(squashfs,'read_directory',return_value=[record]): child=list_children(fs,parent).children[0]
+        self.assertEqual((parent.absolute_path,child.parent_path,child.absolute_path,child.raw_name),(b'/parent',b'/parent',b'/parent/child',b'child'))
+    def test_list_children_rejects_non_directory_node(self):
+        fs=open_filesystem(self.physical(((b'f',2,2,None),))); file=list_children(fs,get_root(fs)).children[0]
+        with patch.object(squashfs,'read_directory') as reader:
+            with self.assertRaisesRegex(SquashFSNodeTypeError,'not a directory'): list_children(fs,file)
+        self.assertEqual(reader.call_count,0)
+    def test_graph_errors_do_not_leak_lower_level_types(self):
+        fs=open_filesystem(self.physical()); root=get_root(fs); cases=((SquashFSDirectoryError('d'),SquashFSDirectoryReadError,'read_directory'),(SquashFSInodeError('i'),SquashFSChildInodeError,'read_inode'))
+        for error,typ,name in cases:
+            extra=patch.object(squashfs,'read_directory',return_value=[SquashFSDirectoryRecord(1,1,b'a',fs.root_inode.reference)]) if name=='read_inode' else None
+            with (extra or ExitStack()), patch.object(squashfs,name,side_effect=error):
+                with self.assertRaises(typ) as caught: list_children(fs,root)
+            self.assertIs(caught.exception.__cause__,error)
+        record=SquashFSDirectoryRecord(1,1,b'',fs.root_inode.reference)
+        with patch.object(squashfs,'read_directory',return_value=[record]),patch.object(squashfs,'read_inode',return_value=fs.root_inode):
+            with self.assertRaises(SquashFSDirectoryEntryError): list_children(fs,root)
+    def test_list_children_is_not_recursive(self):
+        fs=open_filesystem(self.physical(((b'self',1,1,0),))); root=get_root(fs)
+        with patch.object(squashfs,'read_directory',wraps=squashfs.read_directory) as rd,patch.object(squashfs,'read_inode',wraps=squashfs.read_inode) as ri:
+            children=list_children(fs,root).children
+        self.assertEqual((len(children),rd.call_count,ri.call_count),(1,1,1)); self.assertIsInstance(children[0],SquashFSDirectoryNode)
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_root_listing_order_types_and_identity(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); root=get_root(fs); listing=list_children(fs,root)
+        self.assertEqual(len(listing.children),13); self.assertEqual(listing.directory_path,b'/')
+        self.assertEqual(tuple(node.raw_name for node in listing.children),tuple(record.name for record in read_directory(SquashFSMetadataStream(fs.image,fs.superblock.directory_table_start),fs.root_inode.body)))
+        self.assertIsInstance(next(node for node in listing.children if node.raw_name==b'bin'),SquashFSDirectoryNode)
+        self.assertEqual(len({node.raw_name for node in listing.children}),len(listing.children))
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_root_listing_lazy_call_counts(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); root=get_root(fs); names=('read_inode_xattrs','read_and_decode_xattr','read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','resolve_inode_number')
+        with ExitStack() as stack:
+            rd=stack.enter_context(patch.object(squashfs,'read_directory',wraps=squashfs.read_directory)); ri=stack.enter_context(patch.object(squashfs,'read_inode',wraps=squashfs.read_inode)); spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]
+            listing=list_children(fs,root)
+        self.assertEqual((rd.call_count,ri.call_count),(1,len(listing.children))); self.assertTrue(all(x.call_count==0 for x in spies))
+    def test_listing_model_validation_and_immutability(self):
+        with self.assertRaises(SquashFSFilesystemGraphError): SquashFSDirectoryListing(b'x',())
+        with self.assertRaises(SquashFSFilesystemGraphError): SquashFSDirectoryListing(b'/',[])
+        listing=SquashFSDirectoryListing(b'/',()); self.assertEqual(listing,SquashFSDirectoryListing(b'/',()))
+        with self.assertRaises(AttributeError): listing.children=()
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_public_arguments_and_directory_ownership(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); root=get_root(fs)
+        with self.assertRaises(SquashFSFilesystemGraphError): list_children(object(),root)
+        with self.assertRaises(SquashFSFilesystemGraphError): list_children(fs,object())
+        with self.assertRaises(SquashFSFilesystemGraphError): list_children(open_filesystem(SquashFSImage(ROOTFS)),root)
+
+class SquashFSPathLookupStage23C2Test(unittest.TestCase):
+    def image(self, records=()):
+        self.fixture = SquashFSDirectoryListingStage23C1Test(); return self.fixture.physical(records)
+
+    def physical_tree(self, tree):
+        """Build a compact physical SquashFS image with basic inode bodies."""
+        nodes=[]
+        def collect(name, value):
+            node={'name':name,'value':value,'number':len(nodes)+1}; nodes.append(node)
+            if isinstance(value, dict):
+                for child_name, child_value in value.items(): collect(child_name,child_value)
+            return node
+        root=collect(None,tree)
+        by_name={id(node['value']):node for node in nodes if isinstance(node['value'],dict)}
+        offsets={}; cursor=0
+        for node in nodes:
+            offsets[id(node)]=cursor
+            cursor += BASIC_DIRECTORY_INODE_SIZE if isinstance(node['value'],dict) else (BASIC_SYMLINK_INODE_SIZE if node['value']=='symlink' else BASIC_REGULAR_INODE_SIZE)
+        directory_data=bytearray()
+        for node in nodes:
+            if not isinstance(node['value'],dict): continue
+            node['directory_offset']=len(directory_data)
+            entries=[]
+            for name, value in node['value'].items():
+                child=by_name[id(value)] if isinstance(value,dict) else next(x for x in nodes if x['value']==value)
+                kind=BASIC_DIRECTORY_INODE_TYPE if isinstance(value,dict) else (BASIC_SYMLINK_INODE_TYPE if value=='symlink' else BASIC_REGULAR_INODE_TYPE)
+                entries.append(DIRECTORY_ENTRY_STRUCT.pack(offsets[id(child)],child['number']-node['number'],kind,len(name)-1)+name)
+            table=DIRECTORY_HEADER_STRUCT.pack(len(entries)-1,0,node['number'])+b''.join(entries) if entries else b''
+            node['directory_size']=DIRECTORY_POSITION_OFFSET+len(table); directory_data.extend(table)
+        inode=bytearray()
+        for node in nodes:
+            if isinstance(node['value'],dict): body=BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(0,2,node['directory_size'],node['directory_offset'],0); kind=BASIC_DIRECTORY_INODE_TYPE
+            elif node['value']=='symlink': body=BASIC_SYMLINK_INODE_BODY_STRUCT.pack(1,0); kind=BASIC_SYMLINK_INODE_TYPE
+            else: body=BASIC_REGULAR_INODE_BODY_STRUCT.pack(0,SQUASHFS_INVALID_FRAGMENT,0,0); kind=BASIC_REGULAR_INODE_TYPE
+            inode.extend(INODE_HEADER_STRUCT.pack(kind,0,0,0,0,node['number'])+body)
+        istart=96; dstart=istart+2+len(inode); raw=bytearray(dstart+2+len(directory_data))
+        raw[:96]=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,len(nodes),0,4096,0,6,12,0,1,4,0,0,len(raw),0,SQUASHFS_INVALID_BLK,istart,dstart,0,0)
+        raw[istart:istart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(inode)); raw[istart+2:dstart]=inode
+        raw[dstart:dstart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(directory_data)); raw[dstart+2:]=directory_data
+        directory=tempfile.TemporaryDirectory(); path=Path(directory.name)/'tree.sqfs'; path.write_bytes(raw); self.addCleanup(directory.cleanup); return SquashFSImage(path)
+
+    def tree(self):
+        return self.physical_tree({b'wanted':{b'nested':{b'file':'file'}},b'unrelated':{b'sibling':'file'},b'link':'symlink',b'Case':'file',b'\xff':'file',b'file':'file'})
+
+    def test_positive_physical_paths_and_node_immutability(self):
+        fs=open_filesystem(self.tree())
+        expected=((b'/',SquashFSDirectoryNode,None),(b'/wanted',SquashFSDirectoryNode,b'wanted'),(b'/wanted/nested',SquashFSDirectoryNode,b'nested'),(b'/wanted/nested/file',SquashFSRegularFileNode,b'file'),(b'/link',SquashFSSymlinkNode,b'link'),(b'/\xff',SquashFSRegularFileNode,b'\xff'))
+        for path, kind, name in expected:
+            node=lookup_path(fs,path); self.assertIsInstance(node,kind); self.assertEqual((node.raw_name,node.absolute_path),(name,path))
+        self.assertEqual(lookup_path(fs,b'/wanted/nested/file'),lookup_path(fs,b'/wanted/nested/file'))
+        with self.assertRaises(AttributeError): lookup_path(fs,b'/wanted').absolute_path=b'/changed'
+
+    def test_exact_raw_matching_and_missing_paths(self):
+        fs=open_filesystem(self.tree())
+        for path in (b'/case',b'/Cas',b'/CaseX',b'/xCase',b'/\xfe',b'/missing',b'/wanted/missing',b'/wanted/nested/missing'):
+            with self.assertRaises(SquashFSPathNotFoundError) as caught: lookup_path(fs,path)
+            self.assertTrue(str(caught.exception))
+        self.assertEqual(lookup_path(fs,b'/Case').raw_name,b'Case')
+        self.assertEqual(lookup_path(fs,b'/\xff').raw_name,b'\xff')
+
+    def test_syntax_matrix_is_typed_without_normalization(self):
+        fs=open_filesystem(self.tree())
+        for path in (b'',b'bin',b'//bin',b'/bin//ping',b'/bin/',b'/./bin',b'/bin/.',b'/../bin',b'/bin/..',b'/a\0b',b'/bin/\0x','/bin',bytearray(b'/bin'),memoryview(b'/bin'),object()):
+            with self.assertRaises(SquashFSPathError) as caught: lookup_path(fs,path)
+            self.assertIs(type(caught.exception),SquashFSPathError)
+
+    def test_intermediate_regular_symlink_and_controlled_unsupported(self):
+        fs=open_filesystem(self.tree())
+        for path in (b'/file/child',b'/link/child'):
+            with self.assertRaises(SquashFSNotDirectoryError): lookup_path(fs,path)
+        unsupported=SimpleNamespace(raw_name=b'unknown',absolute_path=b'/unknown')
+        with patch.object(squashfs,'list_children',return_value=SimpleNamespace(children=(unsupported,))):
+            with self.assertRaises(SquashFSNotDirectoryError): lookup_path(fs,b'/unknown/child')
+
+    def test_duplicate_same_and_different_inode_are_ambiguous(self):
+        same_fixture=SquashFSDirectoryListingStage23C1Test(); different_fixture=SquashFSDirectoryListingStage23C1Test()
+        same=open_filesystem(same_fixture.physical(((b'x',2,2,None),(b'x',2,2,BASIC_DIRECTORY_INODE_SIZE))))
+        different=open_filesystem(different_fixture.physical(((b'x',2,2,None),(b'x',2,3,None))))
+        for fs in (same,different):
+            listing=list_children(fs,get_root(fs)); self.assertEqual([node.raw_name for node in listing.children],[b'x',b'x'])
+            with self.assertRaises(SquashFSDuplicateNameError) as caught: lookup_path(fs,b'/x')
+            self.assertIn("b'/'",str(caught.exception)); self.assertIn("b'x'",str(caught.exception))
+
+    def test_typed_listing_and_child_failures_propagate_unchanged(self):
+        fs=open_filesystem(self.tree()); root=get_root(fs)
+        directory_error=SquashFSDirectoryReadError('directory')
+        child_error=SquashFSChildInodeError('child')
+        for error in (directory_error,child_error):
+            with patch.object(squashfs,'list_children',side_effect=error):
+                with self.assertRaises(type(error)) as caught: lookup_path(fs,b'/wanted')
+            self.assertIs(caught.exception,error)
+        for raw in (KeyError('k'),IndexError('i'),TypeError('t'),ValueError('v'),SquashFSDirectoryError('d')):
+            with patch.object(squashfs,'read_directory',side_effect=raw):
+                with self.assertRaises(SquashFSDirectoryReadError) as caught: lookup_path(fs,b'/wanted')
+            self.assertIs(caught.exception.__cause__,raw)
+        with patch.object(squashfs,'read_inode',side_effect=SquashFSInodeError('inode')):
+            with self.assertRaises(SquashFSChildInodeError) as caught: lookup_path(fs,b'/wanted')
+        self.assertIsInstance(caught.exception.__cause__,SquashFSInodeError)
+
+    def test_lazy_lookup_expands_only_requested_directories(self):
+        fs=open_filesystem(self.tree())
+        names=('walk_filesystem','build_filesystem_index','read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','read_inode_xattrs','read_and_decode_xattr','resolve_inode_number')
+        with ExitStack() as stack:
+            directory=stack.enter_context(patch.object(squashfs,'read_directory',wraps=squashfs.read_directory)); inode=stack.enter_context(patch.object(squashfs,'read_inode',wraps=squashfs.read_inode)); spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]
+            node=lookup_path(fs,b'/wanted/nested/file')
+        self.assertEqual(node.absolute_path,b'/wanted/nested/file'); self.assertEqual(directory.call_count,3); self.assertEqual(inode.call_count,8); self.assertTrue(all(spy.call_count==0 for spy in spies))
+
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_rootfs_lookup_matrix_and_lazy_reads(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); names=('read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','read_inode_xattrs','read_and_decode_xattr')
+        with ExitStack() as stack:
+            directory=stack.enter_context(patch.object(squashfs,'read_directory',wraps=squashfs.read_directory)); spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]
+            root=lookup_path(fs,b'/'); directory_node=lookup_path(fs,b'/bin'); ping=lookup_path(fs,b'/bin/ping'); symlink=lookup_path(fs,b'/bin/sh')
+        self.assertIsInstance(root,SquashFSDirectoryNode); self.assertIsInstance(directory_node,SquashFSDirectoryNode); self.assertIsInstance(ping,SquashFSRegularFileNode); self.assertIsInstance(symlink,SquashFSSymlinkNode)
+        self.assertEqual(ping.identity,lookup_path(fs,b'/bin/ping').identity); self.assertLessEqual(directory.call_count,5); self.assertTrue(all(spy.call_count==0 for spy in spies))
+        with self.assertRaises(SquashFSPathNotFoundError): lookup_path(fs,b'/definitely-missing-stage23-c2')
+
+
+class SquashFSFilesystemTraversalStage23C3Test(unittest.TestCase):
+    def image(self, records=()): self.fixture = SquashFSDirectoryListingStage23C1Test(); return self.fixture.physical(records)
+    def tree(self): self.path_fixture=SquashFSPathLookupStage23C2Test(); return self.path_fixture.physical_tree({b'a':{b'file1':'file',b'sub':{b'file2':'file'}},b'b':{b'file3':'file'},b'link':'symlink'})
+    def test_root_only_and_empty_traversal(self):
+        empty_fixture=SquashFSPathLookupStage23C2Test(); self.empty_fixture=empty_fixture
+        for image in (self.image(), empty_fixture.physical_tree({})):
+            fs=open_filesystem(image); nodes=walk_filesystem(fs); self.assertEqual(nodes,(get_root(fs),)); self.assertIsInstance(nodes,tuple)
+    def test_nested_depth_first_preorder_and_on_disk_order(self):
+        nodes=walk_filesystem(open_filesystem(self.tree()))
+        self.assertEqual([node.absolute_path for node in nodes],[b'/',b'/a',b'/a/file1',b'/a/sub',b'/a/sub/file2',b'/b',b'/b/file3',b'/link'])
+    def test_symlink_is_yielded_and_never_followed(self):
+        fs=open_filesystem(self.tree())
+        with patch.object(squashfs,'read_basic_symlink') as basic, patch.object(squashfs,'read_extended_symlink') as extended:
+            nodes=walk_filesystem(fs)
+        self.assertIsInstance(nodes[-1],SquashFSSymlinkNode); self.assertEqual((basic.call_count,extended.call_count),(0,0))
+    def test_hardlinked_regular_inode_is_yielded_at_all_paths(self):
+        fs=open_filesystem(self.image(((b'a',2,2,None),(b'b',2,2,BASIC_DIRECTORY_INODE_SIZE))))
+        nodes=walk_filesystem(fs); self.assertEqual([x.absolute_path for x in nodes],[b'/',b'/a',b'/b']); self.assertNotEqual(nodes[1].absolute_path,nodes[2].absolute_path); self.assertEqual(nodes[1].identity,nodes[2].identity)
+    def test_self_directory_cycle_is_typed(self):
+        fs=open_filesystem(self.image(((b'self',1,1,0),)))
+        with self.assertRaises(SquashFSDirectoryCycleError) as caught: walk_filesystem(fs)
+        self.assertIn("b'/self'",str(caught.exception)); self.assertIn('SquashFSInodeIdentity',str(caught.exception))
+    def test_ancestor_directory_cycle_is_typed(self):
+        fs=open_filesystem(self.tree()); root=get_root(fs); a=next(x for x in list_children(fs,root).children if x.raw_name==b'a'); b=next(x for x in list_children(fs,a).children if x.raw_name==b'sub')
+        back=SquashFSDirectoryNode(fs,a.identity,a.inode,b'back',b.absolute_path,b.absolute_path+b'/back',SquashFSNodeType.DIRECTORY)
+        original=squashfs.list_children
+        def listings(filesystem,node): return SimpleNamespace(children=(back,)) if node.absolute_path==b.absolute_path else original(filesystem,node)
+        with patch.object(squashfs,'list_children',side_effect=listings):
+            with self.assertRaises(SquashFSDirectoryCycleError) as caught: walk_filesystem(fs)
+        self.assertIn("b'/a/sub/back'",str(caught.exception)); self.assertIn(repr(a.identity),str(caught.exception))
+    def test_duplicate_absolute_path_is_rejected(self):
+        fs=open_filesystem(self.image(((b'x',2,2,None),(b'x',2,2,BASIC_DIRECTORY_INODE_SIZE))))
+        with self.assertRaises(SquashFSDuplicateNameError): walk_filesystem(fs)
+    def test_traversal_errors_preserve_public_boundaries(self):
+        fs=open_filesystem(self.tree())
+        for error in (SquashFSDirectoryReadError('directory'),SquashFSChildInodeError('child')):
+            with patch.object(squashfs,'list_children',side_effect=error):
+                with self.assertRaises(type(error)) as caught: walk_filesystem(fs)
+            self.assertIs(caught.exception,error)
+    def test_traversal_performs_no_content_or_xattr_reads(self):
+        fs=open_filesystem(self.tree()); names=('read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','read_inode_xattrs','read_and_decode_xattr','resolve_inode_number','read_node_bytes','read_node_symlink','read_node_xattrs','build_filesystem_index')
+        with ExitStack() as stack:
+            spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]; walk_filesystem(fs)
+        self.assertTrue(all(spy.call_count==0 for spy in spies))
+    def test_repeated_traversal_is_deterministic_and_immutable(self):
+        fs=open_filesystem(self.tree()); first=walk_filesystem(fs); second=walk_filesystem(fs); self.assertEqual(first,second)
+        with self.assertRaises(TypeError): first[0]=second[0]
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_rootfs_traversal_matrix(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); names=('read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','read_inode_xattrs','read_and_decode_xattr')
+        with ExitStack() as stack:
+            spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]; nodes=walk_filesystem(fs)
+        types={kind:sum(node.node_type.value==kind for node in nodes) for kind in ('directory','regular_file','symlink','unsupported')}
+        self.assertEqual((len(nodes),types,max(node.absolute_path.count(b'/') for node in nodes)),(43433,{'directory':5329,'regular_file':35952,'symlink':2152,'unsupported':0},17)); self.assertEqual(sum(node.absolute_path==b'/bin/ping' for node in nodes),1); self.assertEqual(len({node.absolute_path for node in nodes}),len(nodes)); self.assertTrue(all(spy.call_count==0 for spy in spies))
+
+
+class SquashFSFilesystemIndexStage23C3Test(unittest.TestCase):
+    def image(self, records=()): self.fixture=SquashFSDirectoryListingStage23C1Test(); return self.fixture.physical(records)
+    def tree(self): self.path_fixture=SquashFSPathLookupStage23C2Test(); return self.path_fixture.physical_tree({b'a':{b'one':'file'},b'b':{b'two':'file'},b'link':'symlink'})
+    def test_index_model_invariants_and_immutability(self):
+        fs=open_filesystem(self.image()); root=get_root(fs); paths=MappingProxyType({b'/':root}); reverse=MappingProxyType({root.identity:(b'/',)})
+        index=SquashFSFilesystemIndex(root,(root,),paths,reverse); self.assertEqual(index,SquashFSFilesystemIndex(root,(root,),paths,reverse))
+        with self.assertRaises(AttributeError): index.nodes=()
+        with self.assertRaises(TypeError): index.paths[b'/x']=root
+        for nodes, path_map, inode_map in (((root,root),paths,reverse),((root,root),MappingProxyType({b'/':root}),reverse),((root,),MappingProxyType({}),reverse),((root,),paths,MappingProxyType({}))):
+            with self.assertRaises(SquashFSFilesystemIndexError): SquashFSFilesystemIndex(root,nodes,path_map,inode_map)
+    def test_root_only_and_nested_index(self):
+        fs=open_filesystem(self.tree()); index=build_filesystem_index(fs)
+        self.assertEqual(index.nodes,walk_filesystem(fs)); self.assertEqual(index.paths[b'/'],index.root); self.assertIs(node_for_path(index,b'/a/one'),index.paths[b'/a/one']); self.assertEqual(set(index.paths),{node.absolute_path for node in index.nodes}); self.assertEqual(index,build_filesystem_index(fs))
+    def test_node_for_path_validation_and_missing_paths(self):
+        index=build_filesystem_index(open_filesystem(self.tree()))
+        self.assertEqual(node_for_path(index,b'/').absolute_path,b'/')
+        for path in (b'/missing',b'',b'a',b'//a',b'/a/',b'/./a',b'/a/..',b'/a\0b','/a',bytearray(b'/a'),memoryview(b'/a'),object()):
+            with self.assertRaises((SquashFSPathError,SquashFSPathNotFoundError)): node_for_path(index,path)
+    def test_paths_for_inode_validation_and_single_path(self):
+        index=build_filesystem_index(open_filesystem(self.tree())); root=index.root
+        self.assertEqual(paths_for_inode(index,root.identity),(b'/',)); self.assertEqual(paths_for_inode(index,SquashFSInodeIdentity(root.identity.reference,999999)),())
+        with self.assertRaises(SquashFSFilesystemIndexError): paths_for_inode(index,object())
+        with self.assertRaises(SquashFSFilesystemIndexError): paths_for_inode(object(),root.identity)
+        self.assertEqual(paths_for_inode(index,root.identity),paths_for_inode(index,root.identity))
+    def test_same_directory_hardlinks_are_reverse_indexed(self):
+        fs=open_filesystem(self.image(((b'a',2,2,None),(b'b',2,2,BASIC_DIRECTORY_INODE_SIZE)))); index=build_filesystem_index(fs); a=node_for_path(index,b'/a'); b=node_for_path(index,b'/b')
+        self.assertIsNot(a,b); self.assertEqual(a.identity,b.identity); self.assertEqual(paths_for_inode(index,a.identity),(b'/a',b'/b'))
+    def test_cross_directory_hardlinks_preserve_traversal_order(self):
+        index=build_filesystem_index(open_filesystem(self.tree())); one=node_for_path(index,b'/a/one'); two=node_for_path(index,b'/b/two')
+        self.assertEqual(one.identity,two.identity); self.assertEqual(paths_for_inode(index,one.identity),(b'/a/one',b'/b/two')); self.assertEqual([node.absolute_path for node in index.nodes],[b'/',b'/a',b'/a/one',b'/b',b'/b/two',b'/link'])
+    def test_duplicate_paths_and_cycles_are_rejected(self):
+        duplicate_fixture=SquashFSDirectoryListingStage23C1Test(); cycle_fixture=SquashFSDirectoryListingStage23C1Test()
+        duplicate=open_filesystem(duplicate_fixture.physical(((b'x',2,2,None),(b'x',2,2,BASIC_DIRECTORY_INODE_SIZE))))
+        cycle=open_filesystem(cycle_fixture.physical(((b'self',1,1,0),)))
+        with self.assertRaises(SquashFSDuplicateNameError): build_filesystem_index(duplicate)
+        with self.assertRaises(SquashFSDirectoryCycleError): build_filesystem_index(cycle)
+    def test_index_build_performs_no_content_or_xattr_reads(self):
+        fs=open_filesystem(self.tree()); names=('read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','read_inode_xattrs','read_and_decode_xattr','read_node_bytes','read_node_symlink','read_node_xattrs','resolve_inode_number','lookup_path')
+        with ExitStack() as stack:
+            spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]; build_filesystem_index(fs)
+        self.assertTrue(all(spy.call_count==0 for spy in spies))
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_rootfs_index_and_hardlink_groups(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); index=build_filesystem_index(fs); ping=node_for_path(index,b'/bin/ping'); repeated=[paths for paths in index.inode_paths.values() if len(paths)>1]
+        self.assertEqual((len(index.nodes),len(index.paths),len(index.inode_paths),len(repeated)),(43433,43433,43427,5)); self.assertIsInstance(ping,SquashFSRegularFileNode); self.assertIn(b'/bin/ping',paths_for_inode(index,ping.identity)); self.assertEqual(repeated,[(b'/bin/bunzip2',b'/bin/bzcat',b'/bin/bzip2'),(b'/bin/gunzip',b'/bin/uncompress'),(b'/usr/bin/perl',b'/usr/bin/perl5.32.1'),(b'/usr/bin/perlbug',b'/usr/bin/perlthanks'),(b'/usr/bin/unzip',b'/usr/bin/zipinfo')])
+
+
+class SquashFSFilesystemContentStage23DTest(unittest.TestCase):
+    def tree(self): self.fixture=SquashFSPathLookupStage23C2Test(); return self.fixture.physical_tree({b'file':'file',b'link':'symlink'})
+    def extended_symlink_tree(self, target=b'../target', *, extended=True):
+        """A two-inode physical image: basic root directory and extended link."""
+        root_size=BASIC_DIRECTORY_INODE_SIZE; child_ref=root_size
+        link_type=EXTENDED_SYMLINK_INODE_TYPE if extended else BASIC_SYMLINK_INODE_TYPE
+        record=DIRECTORY_ENTRY_STRUCT.pack(child_ref,1,link_type,len(b'link')-1)+b'link'
+        directory=DIRECTORY_HEADER_STRUCT.pack(0,0,1)+record; directory_size=DIRECTORY_POSITION_OFFSET+len(directory)
+        root=INODE_HEADER_STRUCT.pack(BASIC_DIRECTORY_INODE_TYPE,0,0,0,0,1)+BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(0,2,directory_size,0,0)
+        link_body=EXTENDED_SYMLINK_INODE_BODY_STRUCT.pack(1,len(target),0xffffffff) if extended else BASIC_SYMLINK_INODE_BODY_STRUCT.pack(1,len(target))
+        link=INODE_HEADER_STRUCT.pack(link_type,0,0,0,0,2)+link_body+target
+        inode=root+link; istart=96; dstart=istart+2+len(inode); raw=bytearray(dstart+2+len(directory))
+        raw[:96]=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,2,0,4096,0,6,12,0,1,4,0,0,len(raw),0,SQUASHFS_INVALID_BLK,istart,dstart,0,0)
+        raw[istart:istart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(inode)); raw[istart+2:dstart]=inode
+        raw[dstart:dstart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(directory)); raw[dstart+2:]=directory
+        directory_handle=tempfile.TemporaryDirectory(); path=Path(directory_handle.name)/'extended-link.sqfs'; path.write_bytes(raw); self.addCleanup(directory_handle.cleanup); return SquashFSImage(path)
+    def extended_empty_regular_tree(self):
+        """Physical root directory plus a parsed type-9 zero-length child inode."""
+        root_size=BASIC_DIRECTORY_INODE_SIZE; record=DIRECTORY_ENTRY_STRUCT.pack(root_size,1,EXTENDED_REGULAR_INODE_TYPE,len(b'empty')-1)+b'empty'
+        directory=DIRECTORY_HEADER_STRUCT.pack(0,0,1)+record; directory_size=DIRECTORY_POSITION_OFFSET+len(directory)
+        root=INODE_HEADER_STRUCT.pack(BASIC_DIRECTORY_INODE_TYPE,0,0,0,0,1)+BASIC_DIRECTORY_INODE_BODY_STRUCT.pack(0,2,directory_size,0,0)
+        empty=INODE_HEADER_STRUCT.pack(EXTENDED_REGULAR_INODE_TYPE,0,0,0,0,2)+EXTENDED_REGULAR_INODE_BODY_STRUCT.pack(0,0,0,1,SQUASHFS_INVALID_FRAGMENT,0,0)
+        inode=root+empty; istart=96; dstart=istart+2+len(inode); raw=bytearray(dstart+2+len(directory))
+        raw[:96]=struct.pack('<IIIIIHHHHHHQQQQQQQQ',SQUASHFS_MAGIC,2,0,4096,0,6,12,0,1,4,0,0,len(raw),0,SQUASHFS_INVALID_BLK,istart,dstart,0,0)
+        raw[istart:istart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(inode)); raw[istart+2:dstart]=inode
+        raw[dstart:dstart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(directory)); raw[dstart+2:]=directory
+        directory_handle=tempfile.TemporaryDirectory(); path=Path(directory_handle.name)/'extended-empty.sqfs'; path.write_bytes(raw); self.addCleanup(directory_handle.cleanup); return SquashFSImage(path)
+    def physical_ool_xattr_node(self, *, inline=False):
+        """Attach a real one-entry OOL XAttr table to a compact graph image."""
+        image=self.tree(); raw=bytearray(image.image.read_bytes()); payload=XAttrSemanticTransportStage22C2Test.RAW
+        name=b'capability'; entry=struct.pack('<HH',0x2 if inline else 0x102,len(name))+name
+        entry+=struct.pack('<I',len(payload) if inline else 8); entry+=payload if inline else struct.pack('<Q',len(entry)+8); metadata=entry if inline else entry+struct.pack('<I',len(payload))+payload
+        xstart=len(raw); idmeta=xstart+2+len(metadata); table=idmeta+2+16; end=table+24
+        raw.extend(b'\0'*(end-len(raw)))
+        raw[xstart:xstart+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|len(metadata)); raw[xstart+2:idmeta]=metadata
+        raw[idmeta:idmeta+2]=struct.pack('<H',METADATA_UNCOMPRESSED_BIT|16); raw[idmeta+2:table]=XATTR_ID_STRUCT.pack(0,1,len(entry))
+        raw[table:table+16]=struct.pack('<QII',xstart,1,0); raw[table+16:end]=struct.pack('<Q',idmeta)
+        raw[40:48]=struct.pack('<Q',end); raw[56:64]=struct.pack('<Q',table); image.image.write_bytes(raw)
+        image.superblock=None; fs=open_filesystem(image); header=SquashFSInodeHeader(9,0,0,0,0,2)
+        body=SquashFSExtendedRegularInode(header,0,0,0,1,SQUASHFS_INVALID_FRAGMENT,0,0); inode=SquashFSInode(SquashFSMetadataReference(0,0),header,body)
+        identity=SquashFSInodeIdentity(inode.reference,2)
+        return fs,SquashFSRegularFileNode(fs,identity,inode,b'xattr',b'/',b'/xattr',SquashFSNodeType.REGULAR_FILE)
+    def test_wrong_node_types_and_xattr_free_node(self):
+        fs=open_filesystem(self.tree()); file, link=list_children(fs,get_root(fs)).children
+        with self.assertRaises(SquashFSNodeTypeError): read_node_bytes(fs,link)
+        with self.assertRaises(SquashFSNodeTypeError): read_node_symlink(fs,file)
+        self.assertIsNone(read_node_xattrs(fs,file))
+    def test_empty_basic_regular_and_symlink_content_helpers(self):
+        fs=open_filesystem(self.tree()); file, link=list_children(fs,get_root(fs)).children
+        self.assertEqual(read_node_bytes(fs,file),b''); self.assertEqual(read_node_bytes(fs,file),b'')
+        self.assertEqual(read_node_symlink(fs,link),''); self.assertEqual(read_node_symlink(fs,link),'')
+        self.assertEqual((file.absolute_path,link.absolute_path),(b'/file',b'/link'))
+    def test_content_reader_failures_are_wrapped_with_causes(self):
+        fs=open_filesystem(self.tree()); file, link=list_children(fs,get_root(fs)).children
+        for symbol,error,node,helper in (('read_basic_regular_file',SquashFSRegularFileError('file'),file,read_node_bytes),('read_basic_symlink',SquashFSSymlinkError('link'),link,read_node_symlink)):
+            with patch.object(squashfs,symbol,side_effect=error):
+                with self.assertRaises(SquashFSNodeContentError) as caught: helper(fs,node)
+            self.assertIs(caught.exception.__cause__,error)
+        foreign=open_filesystem(self.tree())
+        with self.assertRaises(SquashFSFilesystemGraphError): read_node_bytes(foreign,file)
+    def test_xattr_public_boundary_and_no_eager_graph_reads(self):
+        fs=open_filesystem(self.tree()); file=lookup_path(fs,b'/file'); error=SquashFSXAttrInodeError('xattr')
+        with patch.object(squashfs,'read_inode_xattrs',side_effect=error):
+            with self.assertRaises(SquashFSNodeContentError) as caught: read_node_xattrs(fs,file)
+        self.assertIs(caught.exception.__cause__,error)
+        names=('read_node_bytes','read_node_symlink','read_node_xattrs','read_basic_regular_file','read_extended_regular_file','read_basic_symlink','read_extended_symlink','read_inode_xattrs','read_and_decode_xattr')
+        with ExitStack() as stack:
+            spies=[stack.enter_context(patch.object(squashfs,name)) for name in names]; fresh=open_filesystem(self.tree()); root=get_root(fresh); list_children(fresh,root); lookup_path(fresh,b'/file'); walk_filesystem(fresh); build_filesystem_index(fresh)
+        self.assertTrue(all(spy.call_count==0 for spy in spies))
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_regular_wrappers_cover_basic_extended_and_fragment_nodes(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); nodes=walk_filesystem(fs); ping=lookup_path(fs,b'/bin/ping')
+        payload=read_node_bytes(fs,ping); self.assertEqual((payload[:4],payload, ping),(b'\x7fELF',read_node_bytes(fs,ping),lookup_path(fs,b'/bin/ping')))
+        extended=next(node for node in nodes if isinstance(node,SquashFSRegularFileNode) and isinstance(node.inode.body,SquashFSExtendedRegularInode))
+        self.assertEqual(read_node_bytes(fs,extended),read_node_bytes(fs,extended))
+        fragment=next(node for node in nodes if isinstance(node,SquashFSRegularFileNode) and getattr(node.inode.body,'fragment',SQUASHFS_INVALID_FRAGMENT)!=SQUASHFS_INVALID_FRAGMENT)
+        self.assertEqual(read_node_bytes(fs,fragment),read_node_bytes(fs,fragment))
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_ping_xattr_semantics(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); ping=lookup_path(fs,b'/bin/ping'); values=read_node_xattrs(fs,ping)
+        entry=next(item for item in values.entries if item.full_name==b'security.capability'); decoded=read_and_decode_xattr(fs.image,entry)
+        value=decoded.semantic_value
+        self.assertIsInstance(ping,SquashFSRegularFileNode); self.assertFalse(entry.out_of_line); self.assertEqual((entry.value.hex(),decoded.known,decoded.decoder_id,value.effective,value.permitted.raw_mask,value.permitted.capability_numbers,value.permitted.known_names,value.inheritable.capability_numbers,value.root_id),('0100000200200000000000000000000000000000',True,'linux.security.capability',True,0x2000,(13,),('CAP_NET_RAW',),(),None)); self.assertEqual(decoded,read_and_decode_xattr(fs.image,entry))
+    def test_node_wrapper_physical_ool_xattr_and_semantic_snapshots(self):
+        fs,node=self.physical_ool_xattr_node(); before=(node,node.inode,fs.superblock)
+        listing=read_node_xattrs(fs,node); entry=listing.entries[0]; decoded=read_and_decode_xattr(fs.image,entry)
+        snapshot=(listing,listing.entries,entry,decoded,decoded.semantic_value,decoded.raw_value,node,node.inode,fs.superblock)
+        self.assertEqual((entry.full_name,entry.out_of_line,entry.value,entry.out_of_line_reference,decoded.known,decoded.raw_value,decoded.semantic_value.permitted.known_names),(b'security.capability',True,None,len(struct.pack('<HH',0x102,len(b'capability'))+b'capability'+struct.pack('<I',8)+struct.pack('<Q',0)),True,XAttrSemanticTransportStage22C2Test.RAW,('CAP_CHOWN',)))
+        self.assertEqual(read_and_decode_xattr(fs.image,read_node_xattrs(fs,node).entries[0]),decoded)
+        self.assertEqual((listing,listing.entries,entry,decoded,decoded.semantic_value,decoded.raw_value,node,node.inode,fs.superblock),snapshot); self.assertEqual((node,node.inode,fs.superblock),before)
+        with self.assertRaises(AttributeError): entry.value=b'changed'
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_extended_regular_physical_content(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); node=next(n for n in walk_filesystem(fs) if isinstance(n,SquashFSRegularFileNode) and isinstance(n.inode.body,SquashFSExtendedRegularInode))
+        payload=read_node_bytes(fs,node); self.assertGreater(len(payload),0); self.assertEqual(payload,read_node_bytes(fs,node)); self.assertEqual(node,lookup_path(fs,node.absolute_path))
+    def test_extended_symlink_physical_wrapper_path(self):
+        for target in (b'../relative',b'/absolute//target'):
+            fs=open_filesystem(self.extended_symlink_tree(target)); node=lookup_path(fs,b'/link')
+            self.assertIsInstance(node,SquashFSSymlinkNode); self.assertIsInstance(node.inode.body,SquashFSExtendedSymlinkInode)
+            self.assertEqual((read_node_symlink(fs,node),read_node_symlink(fs,node),node.absolute_path),(target.decode(),target.decode(),b'/link'))
+    def test_extended_symlink_error_chain(self):
+        fs=open_filesystem(self.extended_symlink_tree()); node=lookup_path(fs,b'/link'); error=SquashFSSymlinkError('malformed')
+        with patch.object(squashfs,'read_extended_symlink',side_effect=error):
+            with self.assertRaises(SquashFSNodeContentError) as caught: read_node_symlink(fs,node)
+        self.assertIs(caught.exception.__cause__,error)
+    def test_unknown_inline_and_ool_semantic_results(self):
+        inline=XAttrSemanticTransportStage22C2Test.inline_entry(b'user.note',b'inline'); image=XAttrSemanticTransportStage22C2Test.target_image(self,b'ool')
+        ool=XAttrSemanticTransportStage22C2Test.ool_entry(b'user.note')
+        self.assertEqual((read_and_decode_xattr(image,inline).known,read_and_decode_xattr(image,ool).known),(False,False))
+    def test_semantic_decoder_and_ool_error_chains(self):
+        image=XAttrSemanticTransportStage22C2Test.target_image(self,XAttrSemanticTransportStage22C2Test.RAW); entry=XAttrSemanticTransportStage22C2Test.ool_entry()
+        with patch.object(squashfs,'read_xattr_out_of_line_value',side_effect=SquashFSXAttrValueError('bad')):
+            with self.assertRaises(XAttrSemanticValueResolutionError) as caught: read_and_decode_xattr(image,entry)
+        self.assertIsInstance(caught.exception.__cause__,SquashFSXAttrValueError)
+        with self.assertRaises(XAttrSemanticDecoderError) as caught: read_and_decode_xattr(XAttrSemanticTransportStage22C2Test.target_image(self,b''),entry)
+        self.assertIsInstance(caught.exception.__cause__,LinuxCapabilityError)
+    def test_node_xattr_public_error_boundary(self):
+        fs,node=self.physical_ool_xattr_node(); error=SquashFSXAttrInodeError('bad')
+        with patch.object(squashfs,'read_inode_xattrs',side_effect=error):
+            with self.assertRaises(SquashFSNodeContentError) as caught: read_node_xattrs(fs,node)
+        self.assertIs(caught.exception.__cause__,error)
+    def test_content_and_xattr_snapshots_are_immutable(self):
+        fs,node=self.physical_ool_xattr_node(); listing=read_node_xattrs(fs,node); entry=listing.entries[0]; result=read_and_decode_xattr(fs.image,entry)
+        snapshot=(fs,node,listing,entry,result,result.semantic_value,result.raw_value)
+        self.assertEqual(snapshot,(fs,node,read_node_xattrs(fs,node),read_node_xattrs(fs,node).entries[0],read_and_decode_xattr(fs.image,entry),result.semantic_value,result.raw_value))
+        for value,attribute in ((node,'absolute_path'),(listing,'entries'),(entry,'value'),(result,'raw_value')):
+            with self.assertRaises(AttributeError): setattr(value,attribute,b'changed')
+    def test_extended_empty_regular_file_through_node_wrapper(self):
+        fs=open_filesystem(self.tree()); base=lookup_path(fs,b'/file'); header=SquashFSInodeHeader(9,0,0,0,0,2); body=SquashFSExtendedRegularInode(header,0,0,0,1,SQUASHFS_INVALID_FRAGMENT,0,0); inode=SquashFSInode(base.inode.reference,header,body); node=SquashFSRegularFileNode(fs,SquashFSInodeIdentity(inode.reference,2),inode,b'empty',b'/',b'/empty',SquashFSNodeType.REGULAR_FILE)
+        snapshot=(fs,node,node.inode); self.assertEqual((read_node_bytes(fs,node),read_node_bytes(fs,node)),(b'',b'')); self.assertEqual((fs,node,node.inode),snapshot)
+    def test_extended_regular_binary_payload_is_exact(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); node=lookup_path(fs,b'/bin/ping'); payload=read_node_bytes(fs,node)
+        self.assertIsInstance(node.inode.body,SquashFSExtendedRegularInode); self.assertEqual(payload,read_extended_regular_file(fs.image,fs.inode_stream,node.inode)); self.assertEqual(payload[:4],b'\x7fELF')
+    def test_extended_fragment_backed_file_reconstructs_exactly(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); node=next(n for n in walk_filesystem(fs) if isinstance(n,SquashFSRegularFileNode) and isinstance(n.inode.body,SquashFSExtendedRegularInode) and n.inode.body.fragment!=SQUASHFS_INVALID_FRAGMENT)
+        snapshot=(fs,node,node.inode); payload=read_node_bytes(fs,node); self.assertEqual((payload,read_node_bytes(fs,node),len(payload)),(read_extended_regular_file(fs.image,fs.inode_stream,node.inode),payload,node.inode.body.file_size)); self.assertEqual((fs,node,node.inode),snapshot)
+    def test_extended_regular_reader_error_preserves_cause(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); node=lookup_path(fs,b'/bin/ping'); error=SquashFSRegularFileError('extended')
+        with patch.object(squashfs,'read_extended_regular_file',side_effect=error):
+            with self.assertRaises(SquashFSNodeContentError) as caught: read_node_bytes(fs,node)
+        self.assertIs(caught.exception.__cause__,error)
+    def test_regular_read_preserves_filesystem_and_node_snapshots(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); basic=next(n for n in walk_filesystem(fs) if isinstance(n,SquashFSRegularFileNode) and isinstance(n.inode.body,SquashFSBasicRegularInode)); extended=lookup_path(fs,b'/bin/ping'); snapshot=(fs,basic,basic.inode,extended,extended.inode)
+        read_node_bytes(fs,basic); read_node_bytes(fs,extended); self.assertEqual((fs,basic,basic.inode,extended,extended.inode),snapshot)
+        with self.assertRaises(AttributeError): fs.image=None
+    def test_basic_symlink_relative_absolute_and_empty_targets(self):
+        for target in (b'../relative',b'/absolute//target',b''):
+            fs=open_filesystem(self.extended_symlink_tree(target,extended=False)); node=lookup_path(fs,b'/link'); snapshot=(fs,node,node.inode)
+            self.assertIsInstance(node.inode.body,SquashFSBasicSymlinkInode); self.assertEqual((read_node_symlink(fs,node),read_node_symlink(fs,node)),(target.decode(),target.decode())); self.assertEqual((fs,node,node.inode),snapshot)
+    def test_read_node_symlink_rejects_foreign_filesystem_node(self):
+        first=open_filesystem(self.extended_symlink_tree(b'x',extended=False)); second=open_filesystem(self.extended_symlink_tree(b'y',extended=False)); node=lookup_path(first,b'/link')
+        with self.assertRaises(SquashFSFilesystemGraphError): read_node_symlink(second,node)
+    def test_symlink_reads_preserve_filesystem_and_node_snapshots(self):
+        for extended in (False,True):
+            fs=open_filesystem(self.extended_symlink_tree(b'../x',extended=extended)); node=lookup_path(fs,b'/link'); snapshot=(fs,node,node.inode); read_node_symlink(fs,node); read_node_symlink(fs,node); self.assertEqual((fs,node,node.inode),snapshot)
+    def test_inline_node_xattrs_with_table_and_none(self):
+        fs,node=self.physical_ool_xattr_node(inline=True); table=read_xattr_id_table(fs.image); snapshot=(node,table,table.metadata_block_offsets)
+        first=read_node_xattrs(fs,node,table); second=read_node_xattrs(fs,node)
+        self.assertEqual((first.entries[0].full_name,first.entries[0].value,first.entries[0].out_of_line,first,second),(b'security.capability',XAttrSemanticTransportStage22C2Test.RAW,False,second,first)); self.assertEqual((node,table,table.metadata_block_offsets),snapshot)
+    def test_read_node_xattrs_reuses_supplied_table(self):
+        fs,node=self.physical_ool_xattr_node(); table=read_xattr_id_table(fs.image)
+        with patch.object(squashfs,'read_inode_xattrs',wraps=read_inode_xattrs) as reader: result=read_node_xattrs(fs,node,table)
+        self.assertEqual((reader.call_args.args,(result.entries[0].full_name,table)),((fs.image,node.inode,table),(b'security.capability',table)))
+    def test_invalid_table_and_inode_xattr_id_are_typed(self):
+        fs,node=self.physical_ool_xattr_node()
+        for bad_table in (object(),):
+            with self.assertRaises(SquashFSNodeContentError): read_node_xattrs(fs,node,bad_table)
+        bad=SquashFSExtendedRegularInode(node.inode.header,0,0,0,1,SQUASHFS_INVALID_FRAGMENT,0,1); inode=SquashFSInode(node.inode.reference,node.inode.header,bad); foreign=SquashFSRegularFileNode(fs,SquashFSInodeIdentity(inode.reference,2),inode,b'bad',b'/',b'/bad',SquashFSNodeType.REGULAR_FILE)
+        with self.assertRaises(SquashFSNodeContentError) as caught: read_node_xattrs(fs,foreign)
+        self.assertIsInstance(caught.exception.__cause__,SquashFSXAttrInodeError)
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_real_ping_capability_snapshots_remain_immutable(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); node=lookup_path(fs,b'/bin/ping'); table=read_xattr_id_table(fs.image); listing=read_node_xattrs(fs,node,table); entry=next(x for x in listing.entries if x.full_name==b'security.capability'); result=read_and_decode_xattr(fs.image,entry,table); snapshot=(node,listing,entry,entry.value,result,result.semantic_value,table,table.metadata_block_offsets)
+        again=read_and_decode_xattr(fs.image,read_node_xattrs(fs,node,table).entries[0],table); self.assertEqual((entry.value.hex(),result,again,(node,listing,entry,entry.value,result,result.semantic_value,table,table.metadata_block_offsets)),('0100000200200000000000000000000000000000',again,result,snapshot))
+        with self.assertRaises(AttributeError): result.semantic_value.raw_value=b'changed'
+    def test_physical_extended_empty_regular_file_via_lookup(self):
+        filesystem=open_filesystem(self.extended_empty_regular_tree()); snapshots=(filesystem,filesystem.root_inode)
+        with (patch.object(squashfs,'read_extended_regular_file',wraps=read_extended_regular_file) as extended,
+              patch.object(squashfs,'read_basic_regular_file',wraps=read_basic_regular_file) as basic,
+              patch.object(squashfs,'read_inode_xattrs',wraps=read_inode_xattrs) as xattrs,
+              patch.object(squashfs,'read_basic_symlink',wraps=read_basic_symlink) as symlink):
+            node=lookup_path(filesystem,b'/empty'); value=read_node_bytes(filesystem,node); repeated=read_node_bytes(filesystem,node)
+        self.assertIsInstance(node,SquashFSRegularFileNode); self.assertIsInstance(node.inode.body,SquashFSExtendedRegularInode)
+        self.assertEqual((node.absolute_path,node.raw_name,node.inode.body.file_size,value,repeated),(b'/empty',b'empty',0,b'',b''))
+        self.assertEqual((extended.call_count,basic.call_count,xattrs.call_count,symlink.call_count),(2,0,0,0)); self.assertEqual((filesystem,filesystem.root_inode),snapshots)
+        with self.assertRaises(AttributeError): node.absolute_path=b'/changed'
+
+
+class SquashFSFilesystemROOTFSStage23DTest(unittest.TestCase):
+    @unittest.skipUnless(ROOTFS.is_file(), 'UDM Pro ROOTFS fixture is unavailable')
+    def test_final_api_facts(self):
+        fs=open_filesystem(SquashFSImage(ROOTFS)); root=get_root(fs); listing=list_children(fs,root); index=build_filesystem_index(fs)
+        self.assertEqual((len(listing.children),listing.children[0].absolute_path),(13,b'/bin'))
+        self.assertEqual((len(index.nodes),len(index.paths)),(43433,43433))
+
 
 class LinuxCapabilityNamesStage21C1Test(unittest.TestCase):
     def test_mapping_is_complete_immutable_and_exact(self):
